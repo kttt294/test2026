@@ -101,35 +101,56 @@ def generate_random_scenario(
     h        = rng.randint(*height_range)
     n_days   = rng.randint(*days_range)
     n_agents = rng.randint(*agents_range)
-    n_patrol = max(1, rng.randint(1, max(1, n_agents - 1)))
-    n_series = rng.randint(2, min(n_agents + 2, 8))
-    n_spots  = rng.randint(n_series, n_series * 3)
+    return generate_contest_scenario(seed, w, h, n_agents=n_agents, total_days=n_days)
 
-    plain_r  = rng.uniform(0.40, 0.70)
-    mtn_r    = rng.uniform(0.05, 0.15)
-    lake_r   = rng.uniform(0.05, 0.15)
-    road_r   = rng.uniform(0.10, 0.25)
-    total    = plain_r + mtn_r + lake_r + road_r
 
-    map_cfg = MapGenConfig(
-        width          = w,
-        height         = h,
-        plain_ratio    = plain_r  / total,
-        mountain_ratio = mtn_r   / total,
-        lake_ratio     = lake_r  / total,
-        road_ratio     = road_r  / total,
-        n_series       = n_series,
-        n_spots        = n_spots,
-    )
-    match_cfg = MatchGenConfig(
-        total_days = n_days,
-        fuel_max   = rng.randint(15, 30),
-    )
+FINALS_PRESETS = {16: (4, 10, 14), 24: (5, 14, 20), 32: (7, 20, 28)}
 
-    map_data = _generate_map(rng, map_cfg, n_agents)
-    cfg      = _generate_config(map_cfg, match_cfg)
-    agents   = _generate_agents(rng, map_data, cfg, n_agents, n_patrol)
-    return cfg, map_data, agents
+
+def generate_finals_scenario(seed, size):
+    """BTC 2026-09-18 map ranges; unpublished match parameters remain sampled.
+
+    Source: https://www.procon.gr.jp/uploads/download/BfCVOtsgVAA
+    Patrol/supply split is a training choice, not an official requirement.
+    """
+    count, minimum, maximum = FINALS_PRESETS[size]
+    return generate_contest_scenario(seed, size, n_agents=count, n_spots=size,
+        n_series=random.Random(seed).randint(minimum, maximum), n_patrol=count-1)
+
+
+def generate_contest_scenario(seed, width, height=None, *, n_agents=None, total_days=None,
+                              n_patrol=None, n_series=None, n_spots=None):
+    """BTC Q14/15/20/35/46: fuel, spots, duration, terrain and connectivity."""
+    from env.hex_grid import HexGrid
+    height = width if height is None else height
+    rng = random.Random(seed)
+    count = rng.randint(3, 8) if n_agents is None else n_agents
+    days = rng.randint(4, 10) if total_days is None else total_days
+    steps = [rng.randint(width+height, 4*(width+height)) for _ in range(days)]
+    fuel = rng.randint(steps[0], 3*steps[0])
+    spots = rng.randint(count, max(width, height)) if n_spots is None else n_spots
+    series = rng.randint(1, min(8, spots)) if n_series is None else n_series
+    patrols = rng.randint(1, count-1) if n_patrol is None else n_patrol
+    if not (3 <= count <= 8 and count <= spots <= max(width, height)
+            and 1 <= series <= spots and 1 <= patrols <= count):
+        raise ValueError("Invalid contest agent/spot/series counts")
+    grid = HexGrid(width, height)
+    for attempt in range(100):
+        cfg, board, agents = generate_scenario(seed*1000+attempt,
+            MapGenConfig(width, height, n_spots=spots, n_series=series),
+            MatchGenConfig(total_days=days, fuel_max=fuel), n_agents=count, n_patrol=patrols)
+        cfg.steps_per_day = steps
+        passable = {c.id for c in board.cells if c.terrain != 2}
+        seen, pending = {agents[0].cell}, [agents[0].cell]
+        while pending:
+            cell = pending.pop()
+            for _, neighbor in grid.neighbors(cell):
+                if neighbor in passable and neighbor not in seen:
+                    seen.add(neighbor)
+                    pending.append(neighbor)
+        if seen == passable and {c.terrain for c in board.cells} == {0, 1, 2, 3}:
+            return cfg, board, agents
+    raise ValueError('Unable to generate a connected contest map')
 
 
 # ------------------------------------------------------------------ #

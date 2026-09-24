@@ -25,7 +25,7 @@ import torch
 import config as C
 from env.hex_grid import HexGrid
 from env.models import AgentState, DayState, MapData, MatchConfig
-from pathfinding.astar import find_path
+from env.simulator import HexaUdonSimulator
 
 
 class SelfPlayPool:
@@ -47,6 +47,8 @@ class SelfPlayPool:
     """
 
     def __init__(self, pool_size: int = 5, update_every: int = 1000):
+        if pool_size < 1 or update_every < 1:
+            raise ValueError('pool_size and update_every must be positive')
         self.pool_size    = pool_size
         self.update_every = update_every
         self._pool:     List = []   # stored as CPU models
@@ -80,15 +82,20 @@ class SelfPlayPool:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def build_opponent_view(state: DayState, opp_agents: List[AgentState]) -> DayState:
+    def build_opponent_view(state: DayState, opp_agents: List[AgentState],
+                            opponent_state: Optional[DayState] = None) -> DayState:
         """
         Construct a DayState from the opponent's perspective:
           - my_agents      = opponent agents (so the model sees them as "mine")
           - opponent_cells = our agents' cells
-        Traffic and spot inventory are shared (same physical map).
+        Traffic is common; spot inventory and score are private to each team.
         """
         our_cells = [a.cell for a in state.my_agents]
-        return replace(state, my_agents=opp_agents, opponent_cells=our_cells)
+        return replace(state, my_agents=copy.deepcopy(opp_agents), opponent_cells=our_cells,
+                       spot_inventory=dict(opponent_state.spot_inventory) if opponent_state else dict(state.spot_inventory),
+                       collected_series=set(opponent_state.collected_series) if opponent_state else set(),
+                       daily_series=copy.deepcopy(opponent_state.daily_series) if opponent_state else [],
+                       total_udon=opponent_state.total_udon if opponent_state else 0)
 
     # ------------------------------------------------------------------ #
     # Opponent simulation                                                  #
@@ -102,55 +109,41 @@ class SelfPlayPool:
         map_data:    MapData,
         cfg:         MatchConfig,
         grid:        HexGrid,
+        opponent_state: Optional[DayState] = None,
     ) -> Tuple[List[int], Dict[int, float]]:
         """
         Run the opponent model for one day and return:
           new_opp_cells : updated cell IDs for all opponent agents
           road_steps    : {cell_id: steps} of opponent road usage (for traffic)
         """
-        opp_view     = SelfPlayPool.build_opponent_view(state, opp_agents)
+        # Reuse the exact training decoder and simulator, including waiting
+        # collection and timed refueling. Import here to avoid module-init cycles.
+        from rl.mappo import MAPPOTrainer
+        opp_view = SelfPlayPool.build_opponent_view(state, opp_agents, opponent_state)
         patrol_ids   = [a.id for a in opp_agents if a.type == C.AGENT_PATROL]
-        terrain      = {c.id: c.terrain for c in map_data.cells}
-        agents_by_id = {a.id: a for a in opp_agents}
-        n_spots      = len(map_data.spots)
 
         with torch.no_grad():
             actions, _, _, _ = opp_model.get_action_and_value(
                 opp_view, map_data, cfg, patrol_ids, deterministic=True
             )
 
-        road_steps: Dict[int, float] = {}
-        new_cells:  Dict[int, int]   = {a.id: a.cell for a in opp_agents}
-        steps_left = state.steps_left
-
-        for aid, act in zip(patrol_ids, actions):
-            agent = agents_by_id[aid]
-            if act >= n_spots:
-                continue    # STAY
-
-            target = map_data.spots[act].cell_id
-            result = find_path(
-                grid, terrain, state.traffic,
-                agent.cell, target,
-                step_budget=steps_left,
-                fuel_budget=agent.fuel,
-            )
-            if not result.reachable:
-                continue
-
-            cur = agent.cell
-            for action in result.actions:
-                if terrain.get(cur) == C.TERRAIN_ROAD:
-                    cost = C.STEP_COST[C.TERRAIN_ROAD][state.traffic.get(cur, C.TRAFFIC_CLEAR)]
-                    road_steps[cur] = road_steps.get(cur, 0.0) + cost
-                nxt = grid.neighbor_in_dir(cur, action.direction)
-                if nxt is not None:
-                    cur = nxt
-            new_cells[aid] = cur
-            agent.fuel -= result.total_fuel
-            steps_left -= result.total_steps
-
-        return list(new_cells.values()), road_steps
+        sim = HexaUdonSimulator(cfg, map_data)
+        sim.grid = grid
+        orders = MAPPOTrainer._actions_to_orders(opp_view, map_data, cfg, sim, patrol_ids, actions,
+                                                secondary_routes=opp_model.secondary_routes,
+                                                reserve_spots=opp_model.reserve_spots)
+        following, _ = sim.apply_day(opp_view, orders)
+        updated = following.agents_by_id()
+        for agent in opp_agents:
+            agent.cell = updated[agent.id].cell
+            agent.fuel = updated[agent.id].fuel
+        if opponent_state is not None:
+            opponent_state.spot_inventory = following.spot_inventory
+            opponent_state.day = following.day
+            opponent_state.collected_series = following.collected_series
+            opponent_state.daily_series = following.daily_series
+            opponent_state.total_udon = following.total_udon
+        return [a.cell for a in opp_agents], following._road_step_counts
 
     # ------------------------------------------------------------------ #
     # Opponent agent generation                                            #
@@ -165,19 +158,10 @@ class SelfPlayPool:
         our_cells: List[int],
         seed:      int,
     ) -> List[AgentState]:
-        """
-        Place N opponent agents on the map, avoiding cells used by our team.
-        Opponent agent IDs start at 1001 to avoid collisions with our IDs.
-        """
-        occupied   = set(our_cells)
-        candidates = [
-            c.id for c in map_data.cells
-            if c.terrain == C.TERRAIN_PLAIN and c.id not in occupied
-            and c.id not in map_data.spot_map
-        ]
-        rng      = random.Random(seed)
-        n_place  = min(n_agents, len(candidates))
-        cells    = rng.sample(candidates, n_place)
+        """BTC Q38: all teams start with the same car count and cells."""
+        if n_agents != len(our_cells):
+            raise ValueError("Opponent must have the same starting car count")
+        cells = list(our_cells)
         fuel_max = cfg.fuel_max or 20
 
         agents = []
@@ -192,4 +176,25 @@ class SelfPlayPool:
     # ------------------------------------------------------------------ #
 
     def state_dict(self) -> dict:
-        return {"pool_len": len(self._pool), "episodes": self._episodes}
+        return {"episodes": self._episodes, "pool_size": self.pool_size,
+                "update_every": self.update_every,
+                "models": [model.state_dict() for model in self._pool],
+                "target_masking": [model.target_masking for model in self._pool],
+                "secondary_routes": [model.secondary_routes for model in self._pool],
+                "reserve_spots": [model.reserve_spots for model in self._pool],
+                "fuel_max": [model._fuel_max for model in self._pool]}
+
+    def load_state_dict(self, state: dict, model) -> None:
+        self._episodes = state.get('episodes', 0)
+        self.pool_size = state.get('pool_size', self.pool_size)
+        self.update_every = state.get('update_every', self.update_every)
+        self._pool.clear()
+        for index, weights in enumerate(state.get('models', [])):
+            snapshot = copy.deepcopy(model).cpu()
+            snapshot.load_state_dict(weights)
+            snapshot.target_masking = state.get('target_masking', [False] * len(state['models']))[index]
+            snapshot.secondary_routes = state.get('secondary_routes', [False] * len(state['models']))[index]
+            snapshot.reserve_spots = state.get('reserve_spots', [False] * len(state['models']))[index]
+            snapshot.set_fuel_max(state.get('fuel_max', [20] * len(state['models']))[index])
+            snapshot.eval()
+            self._pool.append(snapshot)

@@ -66,25 +66,27 @@ def test_mcts_expansion_does_not_change_simulator_history():
         assert planner._expand(root, deadline=0) == []
 
 
-def test_selfplay_moves_and_consumes_shared_steps_and_fuel():
+def test_selfplay_uses_independent_steps_and_fuel():
     cfg, mp, sim, state = setup_game()
     state.steps_left = 2
     opponents = [AgentState(100, 0, 0, 20), AgentState(101, 0, 0, 20)]
-    model = SimpleNamespace(get_action_and_value=lambda *a, **kw: ([0, 0], None, None, None))
+    model = SimpleNamespace(secondary_routes=False, reserve_spots=False,
+                            get_action_and_value=lambda *a, **kw: ([0, 0], None, None, None))
     cells, _ = SelfPlayPool.simulate_day(model, opponents, state, mp, cfg, sim.grid)
-    assert cells == [1, 0]
-    assert [a.fuel for a in opponents] == [19, 20]
+    assert cells == [1, 1]
+    assert [a.fuel for a in opponents] == [19, 19]
 
 
 def test_more_than_30_spots_preserves_stay_and_all_targets():
     cfg, mp, sim, state = setup_game(40)
-    model = ActorCritic(hidden=16, max_width=8, max_height=8)
+    model = ActorCritic(hidden=16, max_width=8, max_height=8, max_series=40)
     logits, _ = model.forward(state, mp, cfg, [0])
     assert logits[0].shape == (1, 41)
     assert torch.isfinite(logits[0]).all()
     planner = MCTSPlanner(cfg, mp, sim, model)
     orders = planner._build_orders(state, [0], [40])
-    assert orders[0].actions == []
+    assert len(orders[0].actions) == state.steps_left
+    assert all(a.cmd == "stay" for a in orders[0].actions)
 
 
 def test_curriculum_uses_tiebreaks_and_does_not_count_ties_as_wins():
@@ -132,7 +134,7 @@ def test_rl_and_mcts_orders_at_contest_boundaries(width, n_agents, days, n_spots
         MatchGenConfig(total_days=days), n_agents=n_agents, n_patrol=n_agents-1)
     sim = HexaUdonSimulator(cfg, mp)
     state = sim.reset(agents)
-    model = ActorCritic(hidden=16)
+    model = ActorCritic(hidden=16, max_series=n_spots)
     planner = MCTSPlanner(cfg, mp, sim, model, time_budget_ms=20, beam_width=2)
     first_orders = planner.plan(state)
     assert validate_orders(first_orders, state, mp, sim.grid)[0]

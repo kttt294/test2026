@@ -70,7 +70,9 @@ class _PolicyPlanner(BasePlanner):
         with torch.no_grad():
             actions, _, _, _ = self.trainer.model.get_action_and_value(
                 state, self.map, self.cfg, ids, deterministic=True)
-        return self.trainer._actions_to_orders(state, self.map, self.cfg, self.sim, ids, actions)
+        return self.trainer._actions_to_orders(state, self.map, self.cfg, self.sim, ids, actions,
+            secondary_routes=self.trainer.model.secondary_routes,
+            reserve_spots=self.trainer.model.reserve_spots)
 
 
 # ------------------------------------------------------------------ #
@@ -84,6 +86,7 @@ def run_benchmark(
     verbose:    bool = False,
     model_path: Optional[str] = None,
     mcts_ms:    int = 100,
+    map_size: Optional[int] = None,
 ) -> Dict[str, BenchmarkResult]:
     """
     Run n_games random-map games for each strategy.
@@ -107,7 +110,10 @@ def run_benchmark(
 
     for game_idx in range(n_games):
         game_seed = seed + game_idx
-        cfg, map_data, agents = generate_random_scenario(seed=game_seed)
+        size_options = {} if map_size is None else {
+            'width_range': (map_size, map_size), 'height_range': (map_size, map_size),
+        }
+        cfg, map_data, agents = generate_random_scenario(seed=game_seed, **size_options)
         sim = HexaUdonSimulator(cfg, map_data)
 
         for strat_name in strategies:
@@ -232,15 +238,21 @@ if __name__ == "__main__":
     parser.add_argument("--verbose",    action="store_true")
     parser.add_argument("--model", type=str, help="Checkpoint required for rl or mcts")
     parser.add_argument("--mcts-ms", type=int, default=100, help="Search budget per day")
+    parser.add_argument("--sizes", type=int, nargs="+", choices=[8, 16, 32],
+                        help="Fixed square map suites, e.g. --sizes 8 16 32")
     args = parser.parse_args()
 
     print(f"Benchmarking {args.strategies} over {args.games} games (seed={args.seed})...")
-    results = run_benchmark(
-        n_games    = args.games,
-        seed       = args.seed,
-        strategies = args.strategies,
-        verbose    = args.verbose,
-        model_path = args.model,
-        mcts_ms    = args.mcts_ms,
-    )
-    print_results(results)
+    for size in args.sizes or [None]:
+        if size is not None:
+            print(f"Map size: {size}x{size}")
+        results = run_benchmark(
+            n_games    = args.games,
+            seed       = args.seed,
+            strategies = args.strategies,
+            verbose    = args.verbose,
+            model_path = args.model,
+            mcts_ms    = args.mcts_ms,
+            map_size   = size,
+        )
+        print_results(results)

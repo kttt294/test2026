@@ -1,11 +1,12 @@
 import random
 import heapq
+from copy import deepcopy
 
 import pytest
 
 from env.hex_grid import HexGrid
 from env.models import AgentAction, AgentState, Cell, DayOrder, MapData, MatchConfig, Spot
-from env.simulator import HexaUdonSimulator
+from env.simulator import HexaUdonSimulator, complete_orders
 from env.validator import validate_orders
 from env.map_generator import MapGenConfig, generate_scenario, generate_random_scenario
 from pathfinding.astar import find_path
@@ -24,10 +25,20 @@ def scenario(spots=None, steps=20):
 
 
 def test_astar_reconstruction_matches_cost_and_budget():
-    result = find_path(HexGrid(8, 8), dict.fromkeys(range(64), 0), {}, 57, 52, 6, 3)
+    result = find_path(HexGrid(8, 8), dict.fromkeys(range(64), 0), {}, 1, 12, 6, 3)
     assert result.reachable
     assert result.total_steps == len(result.actions) * 2 <= 6
     assert result.total_fuel == len(result.actions) <= 3
+
+
+def test_lookahead_collects_more_than_two_spots_when_budget_allows():
+    cfg, mp, sim, state = scenario([Spot(i, i, 1) for i in range(1, 7)], steps=30)
+    state.my_agents = [AgentState(0, 0, 0, 20)]
+    planner = LookaheadPlanner(cfg, mp, sim)
+    orders = planner.plan(state)
+    assert validate_orders(orders, state, mp, sim.grid)[0]
+    following, _ = sim.apply_day(state, orders)
+    assert len(following.collected_series) >= 4
 
 
 def test_astar_keeps_slower_fuel_saving_paths():
@@ -55,7 +66,72 @@ def test_reposition_respects_remaining_fuel():
     patrol.fuel = 1
     planner = LookaheadPlanner(cfg, mp, sim)
     actions = planner._append_reposition(patrol, [1], [AgentAction('move', 2)], 20, state)
-    assert validate_orders([DayOrder(0, actions)], state, mp, sim.grid)[0]
+    orders = complete_orders([DayOrder(0, actions)], state, mp, sim.grid)
+    assert validate_orders(orders, state, mp, sim.grid)[0]
+
+
+def test_lookahead_preserves_fuel_for_daily_collection():
+    cfg, mp, sim, state = scenario([Spot(1, 1, 1), Spot(7, 1, 1)])
+    state.my_agents = [AgentState(0, 0, 0, 8)]
+    planner = LookaheadPlanner(cfg, mp, sim)
+    while not sim.is_done(state):
+        orders = planner.plan(state)
+        assert validate_orders(orders, state, mp, sim.grid)[0]
+        state, _ = sim.apply_day(state, orders)
+    assert sum(map(len, state.daily_series)) == 4
+    assert state.total_udon >= 4
+
+
+def test_lookahead_reaches_spot_beyond_fractional_step_share():
+    cfg, mp, sim, state = scenario([Spot(2, 1, 1)], steps=4)
+    orders = LookaheadPlanner(cfg, mp, sim).plan(state)
+    assert validate_orders(orders, state, mp, sim.grid)[0]
+    state, _ = sim.apply_day(state, orders)
+    assert state.collected_series == {1}
+
+
+def test_lookahead_rollouts_preserve_state_and_traffic():
+    cfg, mp, sim, state = scenario()
+    sim.traffic.record_day({3: 8})
+    before, history = deepcopy(state), deepcopy(sim.traffic._history)
+    planner = LookaheadPlanner(cfg, mp, sim)
+    first = planner.plan(state)
+    assert state == before
+    assert sim.traffic._history == history
+    assert planner.plan(state) == first
+
+
+def test_lookahead_expired_budget_returns_greedy(monkeypatch):
+    cfg, mp, sim, state = scenario()
+    state.time_limit_ms = 0
+    planner = LookaheadPlanner(cfg, mp, sim)
+    def unexpected_rollout(*args):
+        pytest.fail('No rollout should run after the deadline')
+    monkeypatch.setattr(planner, '_plan_routes', unexpected_rollout)
+    assert planner.plan(state) == GreedyPlanner(cfg, mp, sim).plan(state)
+
+
+@pytest.mark.parametrize('case', ['low_fuel', 'congested_roads', 'depleted_spots'])
+def test_lookahead_on_extreme_maps(case):
+    cfg, mp, sim, state = scenario([Spot(1, 1, 1), Spot(7, 1, 1)])
+    if case == 'low_fuel':
+        state.my_agents[0].fuel = 1
+    elif case == 'congested_roads':
+        for cell in mp.cells:
+            if cell.id not in mp.spot_map and cell.id not in {0, 8, 9}:
+                cell.terrain = 3
+    planner = LookaheadPlanner(cfg, mp, sim)
+    while not sim.is_done(state):
+        if case == 'depleted_spots':
+            state.spot_inventory = dict.fromkeys(mp.spot_map, 0)
+            state.opponent_cells = list(mp.spot_map)
+        if case == 'congested_roads':
+            state.traffic = {c.id: 2 for c in mp.cells if c.terrain == 3}
+        orders = planner.plan(state)
+        assert validate_orders(orders, state, mp, sim.grid)[0]
+        state, _ = sim.apply_day(state, orders)
+    if case == 'depleted_spots':
+        assert state.total_udon == 0
 
 
 @pytest.mark.parametrize('orders', [

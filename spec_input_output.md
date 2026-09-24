@@ -1,6 +1,6 @@
 # HEXA UDON — Spec Input / Output (nội bộ team)
 
-> Đây là spec **dự đoán** dựa trên đề bài. Khi BTC công bố protocol chính thức, cần đối chiếu và cập nhật.
+> **Bản lịch sử, không dùng để kết nối BTC.** Client đã chuyển sang giao thức chính thức ngày 15/09/2026. Xem [lưu ý grid/giao thức BTC](Đề%20bài/LUU_Y_GRID_VA_GIAO_THUC_BTC.md). Nội dung dự đoán bên dưới được giữ để tham khảo lịch sử.
 
 ---
 

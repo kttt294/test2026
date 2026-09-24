@@ -1,162 +1,159 @@
-"""
-HTTP client for communicating with the contest server.
-
-Endpoints (assumed, update when BTC publishes protocol):
-  GET  /match-config          → MatchConfig + MapData
-  GET  /state/day/{d}         → DayState
-  POST /action/day/{d}        → submit DayOrders
-"""
+"""BTC Procon 37 API. Internal days start at 1; wire days start at 0."""
 from __future__ import annotations
-
-import sys
+from copy import deepcopy
 import os
-sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-
-import json
 import time
-from typing import List, Optional
-
 import requests
-
-from env.models import (
-    AgentAction, AgentState, Cell, CMD_MOVE, CMD_STAY,
-    DayOrder, DayState, MapData, MatchConfig, Spot,
-)
+from env.models import AgentState, Cell, DayOrder, DayState, MapData, MatchConfig, Spot
+from env.simulator import HexaUdonSimulator, complete_orders
 
 
 class ContestClient:
-    def __init__(self, base_url: str, timeout_s: float = 10.0):
-        self.base    = base_url.rstrip("/")
-        self.timeout = timeout_s
+    def __init__(self, base_url: str, timeout_s: float = 10., token: str | None = None):
+        self.base, self.timeout = base_url.rstrip('/'), timeout_s
         self.session = requests.Session()
+        token = token if token is not None else os.environ.get('PROCON_TOKEN')
+        if token:
+            self.session.headers['Procon-Token'] = token
+        self._last_request = 0.
+        self._state = self._accepted = None
+        self._revision = -1
+        self._uncertain = False
 
-    # ------------------------------------------------------------------ #
-    # Phase 0: pre-match                                                   #
-    # ------------------------------------------------------------------ #
+    def get_match_config(self):
+        data = self._get('/setting')
+        board = data['map']
+        cfg = MatchConfig(board['width'], board['height'], len(data['daySteps']), data['daySteps'],
+                          data['players'], data['busyThreshold'], data['jammedThreshold'], data['fuelLimits'])
+        terrain = {0: 0, 1: 3, 2: 1, 3: 2}  # BTC -> existing internal encoding
+        mp = MapData([Cell(r*cfg.width+c, terrain[t]) for r, row in enumerate(board['cells']) for c, t in enumerate(row)],
+                     [Spot(s['pos'], s['brand'], s['stocks']) for s in data['spots']])
+        agents = [AgentState(i, 0, cell, cfg.fuel_max) for i, cell in enumerate(data['agents'])]
+        self._agent_count = len(agents)
+        self._wait_seconds = max(120, sum(data['daySeconds']) + 120)
+        return cfg, mp, agents
 
-    def get_match_config(self) -> tuple[MatchConfig, MapData, List[AgentState]]:
-        resp = self._get("/match-config")
-        cfg      = MatchConfig.from_dict(resp)
-        map_data = MapData.from_dict(resp)
-        agents   = [
-            AgentState(
-                id=a["id"],
-                type=a["type"],
-                cell=a["start_cell"],
-                fuel=a.get("fuel_capacity", 0),
-            )
-            for a in resp["my_agents"]
-        ]
-        return cfg, map_data, agents
+    def submit_agent_kinds(self, kinds):
+        if len(kinds) != self._agent_count or any(type(k) is not int or k not in (0, 1) for k in kinds):
+            raise ValueError('One kind (0 or 1) required per agent')
+        self._post('/agent', kinds)
 
-    # ------------------------------------------------------------------ #
-    # Phase 1: per-day                                                     #
-    # ------------------------------------------------------------------ #
+    def get_day_state(self, day, cfg, map_data, prev_state=None):
+        stop = time.monotonic() + self._wait_seconds
+        while True:
+            try:
+                data = self._get('/')
+                actual_day = data['day'] + 1
+                if actual_day > day:
+                    raise RuntimeError(f'Missed day {day}; server is at day {actual_day}')
+                if actual_day == day:
+                    break
+            except requests.HTTPError as error:
+                if error.response.status_code != 403:
+                    raise
+            if time.monotonic() >= stop:
+                raise TimeoutError(f'Timed out waiting for day {day}')
+            time.sleep(.25)
+        history = prev_state
+        if self._state is not None and day > self._state.day:
+            if self._uncertain:
+                raise RuntimeError('Submission outcome unknown; cannot reconstruct score safely')
+            sim = HexaUdonSimulator(cfg, map_data)
+            orders = self._accepted if self._accepted is not None else complete_orders([], self._state, map_data, sim.grid)
+            history, _ = sim.apply_day(self._state, orders)
+            if len(history.my_agents) != len(data['agents']) or any(
+                    a.cell != b['pos'] or (a.is_patrol() and a.fuel != b['fuel'])
+                    for a, b in zip(history.my_agents, data['agents'])):
+                raise RuntimeError('Server state differs from accepted plan; local score is untrusted')
+            self._accepted, self._revision = None, -1
+        state = DayState(day=day, steps_left=cfg.steps_per_day[day-1],
+                         time_limit_ms=max(0, int((data['endsAt'] - time.time()) * 1000)),
+                         traffic={t['pos']: t['status'] for t in data['traffics']},
+                         spot_inventory={s.cell_id: s.max_inventory for s in map_data.spots},
+                         my_agents=[AgentState(i, a['kind'], a['pos'], a['fuel']) for i, a in enumerate(data['agents'])],
+                         opponent_cells=[a['pos'] for team in data['others'] for a in team['agents']],
+                         collected_series=set(history.collected_series) if history else set(),
+                         daily_series=deepcopy(history.daily_series) if history else [],
+                         total_udon=history.total_udon if history else 0, fuel_max=cfg.fuel_max)
+        self._day_deadline = time.monotonic() + state.time_limit_ms / 1000
+        self._state = deepcopy(state)
+        return state
 
-    def get_day_state(
-        self,
-        day: int,
-        cfg: MatchConfig,
-        map_data: MapData,
-        prev_state: Optional[DayState] = None,
-    ) -> DayState:
-        resp = self._get(f"/state/day/{day}")
-        return self._parse_state(resp, cfg, map_data, prev_state)
+    @staticmethod
+    def encode_orders(orders):
+        ordered = sorted(orders, key=lambda o: o.agent_id)
+        if [o.agent_id for o in ordered] != list(range(len(ordered))):
+            raise ValueError('Orders require unique consecutive agent IDs starting at zero')
+        payload = []
+        for order in ordered:
+            actions = []
+            for action in order.actions:
+                if action.cmd == 'stay' and action.direction is None:
+                    if actions and actions[-1] < 0:
+                        actions[-1] -= 1
+                    else:
+                        actions.append(-1)
+                elif action.cmd == 'move' and type(action.direction) is int and action.direction in range(6):
+                    actions.append(action.direction)
+                else:
+                    raise ValueError('Invalid action')
+            payload.append(actions)
+        return payload
 
-    def submit_orders(self, day: int, orders: List[DayOrder], timeout_s: Optional[float] = None) -> dict:
-        payload = {"orders": [o.to_dict() for o in orders]}
-        resp = self._post(f"/action/day/{day}", payload, timeout_s)
-        return resp
+    def submit_orders(self, day, orders, timeout_s=None):
+        if self._state is not None and day != self._state.day:
+            raise ValueError('Cannot submit orders for a different day')
+        if hasattr(self, '_agent_count') and len(orders) != self._agent_count:
+            raise ValueError('Orders required for every agent')
+        if self._state is not None:
+            remaining = self._day_deadline - time.monotonic() - .05
+            timeout_s = min(self.timeout if timeout_s is None else timeout_s, remaining)
+            if timeout_s <= 0:
+                raise TimeoutError('Day deadline expired')
+        try:
+            response = self._post('/', self.encode_orders(orders), timeout_s)
+        except requests.RequestException:
+            self._uncertain = True
+            raise
+        revision = response.get('revision')
+        if type(revision) is not int:
+            self._uncertain = True
+            raise ValueError('Server response missing integer revision')
+        if revision >= 0 and revision >= self._revision:
+            self._revision, self._accepted = revision, deepcopy(orders)
+            self._uncertain = False
+        return {**response, 'status': 'valid' if revision >= 0 else 'invalid'}
 
-    def submit_with_retry(
-        self,
-        day: int,
-        orders: List[DayOrder],
-        fallback_orders: List[DayOrder],
-        deadline_ms: int,
-        start_ms: float,
-    ) -> dict:
-        """
-        Try to submit orders. If invalid, retry with fallback.
-        start_ms is a time.monotonic() timestamp in seconds (legacy name).
-        Keep 50 ms for response handling; at most two attempts.
-        """
-        for attempt, o in enumerate([orders, fallback_orders]):
+    def submit_with_retry(self, day, orders, fallback_orders, deadline_ms, start_ms):
+        for candidate in (orders, fallback_orders):
             remaining = start_ms + deadline_ms / 1000 - time.monotonic() - .05
             if remaining <= 0:
                 break
             try:
-                resp = self.submit_orders(day, o, timeout_s=remaining)
-                if resp.get("status") == "valid":
-                    return {**resp, "_accepted_orders": o}
-            except Exception as e:
-                print(f"[client] submit attempt {attempt+1} failed: {e}")
-        return {"status": "failed"}
+                result = self.submit_orders(day, candidate, timeout_s=remaining)
+                if result['status'] == 'valid':
+                    return {**result, '_accepted_orders': candidate}
+            except (requests.RequestException, ValueError, TimeoutError) as error:
+                print(f'[client] Submission failed: {type(error).__name__}')
+        return {'status': 'failed'}
 
-    # ------------------------------------------------------------------ #
-    # Parsing                                                              #
-    # ------------------------------------------------------------------ #
+    def _request(self, method, path, body=None, timeout_s=None):
+        budget = self.timeout if timeout_s is None else min(self.timeout, timeout_s)
+        delay = max(0., .21 - (time.monotonic() - self._last_request))
+        if budget <= delay:
+            raise TimeoutError('Submission deadline expired')
+        if delay:
+            time.sleep(delay)
+        self._last_request = time.monotonic()
+        if method == 'GET':
+            response = self.session.get(self.base + path, timeout=budget-delay)
+        else:
+            response = self.session.post(self.base + path, json=body, timeout=budget-delay)
+        response.raise_for_status()
+        return response.json() if response.content else {}
 
-    def _parse_state(
-        self,
-        resp: dict,
-        cfg: MatchConfig,
-        map_data: MapData,
-        prev: Optional[DayState],
-    ) -> DayState:
-        traffic = {r["cell_id"]: r["status"] for r in resp.get("traffic", [])}
-        inventory = {s["cell_id"]: s["inventory"] for s in resp.get("spots", [])}
+    def _get(self, path):
+        return self._request('GET', path)
 
-        agents = []
-        for a in resp.get("my_agents", []):
-            agents.append(AgentState(
-                id=a["id"],
-                type=a["type"],
-                cell=a["cell"],
-                fuel=a.get("fuel", 0),
-            ))
-
-        opponents = [o["cell"] for o in resp.get("opponents", [])]
-
-        # Score bookkeeping carried from prev state (server may also send it)
-        score = resp.get("my_score", {})
-        collected = set(score.get("unique_series", []))
-        total_udon = score.get("total_udon", 0)
-        daily_hist = [set(d) for d in score.get("daily_series_history", [])]
-
-        if prev is not None and not collected:
-            collected  = set(prev.collected_series)
-            total_udon = prev.total_udon
-            daily_hist = list(prev.daily_series)
-
-        return DayState(
-            day=resp["day"],
-            steps_left=resp["steps_left"],
-            time_limit_ms=resp.get("time_limit_ms", 5000),
-            traffic=traffic,
-            spot_inventory=inventory,
-            my_agents=agents,
-            opponent_cells=opponents,
-            collected_series=collected,
-            daily_series=daily_hist,
-            total_udon=total_udon,
-        )
-
-    # ------------------------------------------------------------------ #
-    # HTTP helpers                                                         #
-    # ------------------------------------------------------------------ #
-
-    def _get(self, path: str) -> dict:
-        url = self.base + path
-        resp = self.session.get(url, timeout=self.timeout)
-        resp.raise_for_status()
-        return resp.json()
-
-    def _post(self, path: str, body: dict, timeout_s: Optional[float] = None) -> dict:
-        url = self.base + path
-        timeout = self.timeout if timeout_s is None else min(self.timeout, timeout_s)
-        if timeout <= 0:
-            raise TimeoutError("Submission deadline expired")
-        resp = self.session.post(url, json=body, timeout=timeout)
-        resp.raise_for_status()
-        return resp.json()
+    def _post(self, path, body, timeout_s=None):
+        return self._request('POST', path, body, timeout_s)

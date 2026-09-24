@@ -3,7 +3,7 @@ Actor-Critic network for HEXA UDON.
 
 Architecture:
   Map encoder : CNN over 2D hex grid feature planes → spatial embedding
-  Agent MLP   : per-agent (spatial_embed + fuel_features + type) → agent_feat
+  Agent MLP   : per-agent (spatial_embed + fuel_features + type + position) → agent_feat
   Global MLP  : mean_pool(agent_feats) + collected_mask + day_info → global_feat
   Actor head  : (agent_feat + global_feat) → logits over (n_spots + 1) choices
   Critic head : global_feat → scalar V(state)
@@ -39,6 +39,7 @@ import torch.nn as nn
 import config as C
 from env.hex_grid import HexGrid
 from env.models import DayState, MapData, MatchConfig
+from pathfinding.astar import multi_waypoint_path
 
 
 C_IN          = 10   # feature channels per cell (9 map + 1 opponent presence)
@@ -81,7 +82,7 @@ class ActorCritic(nn.Module):
     def __init__(
         self,
         max_spots:  int = 30,
-        max_series: int = 10,
+        max_series: int = 28,
         max_width:  int = 32,
         max_height: int = 32,
         hidden:     int = C.HIDDEN_DIM,
@@ -92,15 +93,18 @@ class ActorCritic(nn.Module):
         self.max_width  = max_width
         self.max_height = max_height
         self.hidden     = hidden
+        self.target_masking = False  # Opt-in; persisted separately from weights.
+        self.secondary_routes = False  # Route decoder setting, persisted with checkpoints.
+        self.reserve_spots = False  # Opt-in inventory allocation for secondary routes.
 
         # Observed fuel_max for tier thresholds; updated each episode via set_fuel_max().
         self._fuel_max: int = 20
 
         self.map_encoder = MapEncoder(hidden)
 
-        # Agent MLP: cell_embed(hidden) + fuel_feats(4) + agent_type(1)
+        # Agent MLP: cell_embed(hidden) + fuel_feats(4) + agent_type(1) + position(2)
         self.agent_mlp = nn.Sequential(
-            nn.Linear(hidden + FUEL_FEAT_DIM + 1, hidden),
+            nn.Linear(hidden + FUEL_FEAT_DIM + 1 + 2, hidden),
             nn.ReLU(),
             nn.Linear(hidden, hidden // 2),
             nn.ReLU(),
@@ -122,7 +126,7 @@ class ActorCritic(nn.Module):
             nn.Linear(hidden, hidden),
         )
         self.key_mlp = nn.Sequential(
-            nn.Linear(hidden, hidden),
+            nn.Linear(hidden + 2, hidden),
             nn.ReLU(),
             nn.Linear(hidden, hidden),
         )
@@ -146,6 +150,26 @@ class ActorCritic(nn.Module):
 
     def set_fuel_max(self, fuel_max: int) -> None:
         self._fuel_max = fuel_max
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        """Add zero position weights to legacy actors, including self-play snapshots."""
+        migrated = state_dict.copy()
+        if hasattr(state_dict, '_metadata'):
+            migrated._metadata = state_dict._metadata
+        for key, layer in (('agent_mlp.0.weight', self.agent_mlp[0]),
+                           ('key_mlp.0.weight', self.key_mlp[0])):
+            weight = migrated.get(key)
+            if weight is not None and weight.shape == (layer.out_features, layer.in_features - 2):
+                migrated[key] = torch.cat([weight, weight.new_zeros(weight.shape[0], 2)], dim=1)
+        # PyTorch 2.0 does not expose assign; keep the default path compatible.
+        if assign:
+            return super().load_state_dict(migrated, strict=strict, assign=True)
+        return super().load_state_dict(migrated, strict=strict)
+
+    def _position_features(self, row: int, column: int, cfg: MatchConfig) -> torch.Tensor:
+        """Explicit coordinates distinguish otherwise identical local CNN patches."""
+        return torch.tensor([row / max(cfg.height - 1, 1),
+                             column / max(cfg.width - 1, 1)], device=self.device)
 
     def _fuel_features(self, agent, state: DayState) -> torch.Tensor:
         """
@@ -234,6 +258,8 @@ class ActorCritic(nn.Module):
         W = cfg.width
         n_spots  = len(map_data.spots)
         series_ids = map_data.series_ids
+        if len(series_ids) > self.max_series:
+            raise ValueError(f'Map has {len(series_ids)} series; model capacity is {self.max_series}')
 
         # --- map encoding ---
         map_feat = self.encode_map(state, map_data, cfg)   # (1, C_IN, maxH, maxW)
@@ -246,7 +272,8 @@ class ActorCritic(nn.Module):
             cell_embed = spatial[0, :, r, c]                          # (hidden,)
             fuel_feats = self._fuel_features(agent, state)            # (4,)
             atype      = torch.tensor([float(agent.type)], device=self.device)
-            x  = torch.cat([cell_embed, fuel_feats, atype])           # (hidden+5,)
+            position = self._position_features(r, c, cfg)
+            x  = torch.cat([cell_embed, fuel_feats, atype, position])  # (hidden+7,)
             af = self.agent_mlp(x.unsqueeze(0))                       # (1, hidden//2)
             agent_feats.append(af)
 
@@ -282,7 +309,8 @@ class ActorCritic(nn.Module):
                 cell_id = map_data.spots[i].cell_id
                 r_spot, c_spot = divmod(cell_id, W)
                 spot_embed = spatial[0, :, r_spot, c_spot]      # (hidden,)
-                key = self.key_mlp(spot_embed.unsqueeze(0))     # (1, hidden)
+                position = self._position_features(r_spot, c_spot, cfg)
+                key = self.key_mlp(torch.cat([spot_embed, position]).unsqueeze(0))
                 logits[0, i] = (query * key).sum(dim=-1)
 
             # STAY follows the last actual spot, matching every order decoder.
@@ -290,8 +318,45 @@ class ActorCritic(nn.Module):
             logits_list.append(logits)
 
         # --- critic ---
-        value = self.critic_head(global_feat)   # (1, 1)
+        # The critic reads actor features but must not move the policy through
+        # their shared encoder. Its regression loss trains the value head only.
+        value = self.critic_head(global_feat.detach())   # (1, 1)
         return logits_list, value
+
+    def action_distributions(
+        self, state, map_data, cfg, agent_indices, deterministic=False, actions=None,
+    ):
+        """Per-car distributions; other cars cannot consume this car's time budget."""
+        logits_list, value = self.forward(state, map_data, cfg, agent_indices)
+        if actions is not None and len(actions) != len(agent_indices):
+            raise ValueError("One action is required per patrol")
+        if self.target_masking:
+            grid = HexGrid(cfg.width, cfg.height)
+            terrain = {c.id: c.terrain for c in map_data.cells}
+            inventory, steps = dict(state.spot_inventory), state.steps_left
+            agents = state.agents_by_id()
+        chosen, distributions = [], []
+        for i, logits in enumerate(logits_list):
+            scores = logits.squeeze(0)
+            if self.target_masking:
+                agent = agents[agent_indices[i]]
+                paths, valid = [], []
+                for spot in map_data.spots:
+                    path = multi_waypoint_path(grid, terrain, state.traffic, agent.cell,
+                                               [spot.cell_id], steps, agent.fuel)
+                    paths.append(path)
+                    valid.append(bool(path) and inventory.get(spot.cell_id, 0) > 0)
+                valid.append(True)  # STAY is always available, including zero fuel/steps.
+                scores = scores.masked_fill(~torch.tensor(valid, device=self.device), -torch.inf)
+            dist = torch.distributions.Categorical(logits=scores)
+            a = (torch.tensor(actions[i], device=self.device) if actions is not None
+                 else dist.mode if deterministic else dist.sample())
+            choice = a.item()
+            if actions is not None and not torch.isfinite(dist.log_prob(a)):
+                raise ValueError('Saved action is excluded by the current target mask')
+            chosen.append(choice)
+            distributions.append(dist)
+        return chosen, distributions, value
 
     def get_action_and_value(
         self,
@@ -311,16 +376,11 @@ class ActorCritic(nn.Module):
           entropy   : (n_agents,)
           value     : scalar tensor
         """
-        logits_list, value = self.forward(state, map_data, cfg, agent_indices)
-
-        if actions is not None and len(actions) != len(agent_indices):
-            raise ValueError("One action is required per patrol")
-        chosen, log_probs_list, entropy_list = [], [], []
-        for i, logits in enumerate(logits_list):
-            dist = torch.distributions.Categorical(logits=logits.squeeze(0))
-            a = (torch.tensor(actions[i], device=self.device) if actions is not None
-                 else dist.mode if deterministic else dist.sample())
-            chosen.append(a.item())
+        chosen, distributions, value = self.action_distributions(
+            state, map_data, cfg, agent_indices, deterministic, actions)
+        log_probs_list, entropy_list = [], []
+        for choice, dist in zip(chosen, distributions):
+            a = torch.tensor(choice, device=self.device)
             log_probs_list.append(dist.log_prob(a))
             entropy_list.append(dist.entropy())
 

@@ -22,7 +22,7 @@ from copy import deepcopy
 sys.path.insert(0, os.path.dirname(__file__))
 
 from env.models import AgentState, DayOrder, MatchConfig, MapData
-from env.simulator import HexaUdonSimulator
+from env.simulator import HexaUdonSimulator, complete_orders
 from env.validator import validate_orders
 from env.scoring import compute_score
 from strategy.greedy import GreedyPlanner
@@ -123,7 +123,8 @@ def run_train(args):
     from rl.curriculum import CurriculumEngine
     from rl.selfplay import SelfPlayPool
 
-    curriculum = CurriculumEngine(start_level=args.start_level) if args.curriculum else None
+    finals = getattr(args, 'finals', False)
+    curriculum = CurriculumEngine(start_level=args.start_level, finals=finals) if args.curriculum or finals else None
     selfplay   = SelfPlayPool(update_every=args.selfplay_every)  if args.selfplay   else None
 
     trainer = MAPPOTrainer(
@@ -131,17 +132,29 @@ def run_train(args):
         log_dir    = args.log_dir,
         curriculum = curriculum,
         selfplay   = selfplay,
+        seed       = args.seed,
     )
 
-    if args.load and os.path.exists(args.load):
+    if args.load:
         trainer.load(args.load)
+
+    if getattr(args, 'target_masking', None) is not None:
+        trainer.model.target_masking = args.target_masking
+    if getattr(args, 'secondary_routes', None) is not None:
+        trainer.model.secondary_routes = args.secondary_routes
+    if getattr(args, 'reserve_spots', None) is not None:
+        trainer.model.reserve_spots = args.reserve_spots
+    if trainer.model.reserve_spots and not trainer.model.secondary_routes:
+        raise ValueError('--reserve-spots requires --secondary-routes')
 
     trainer.train(
         n_episodes  = args.episodes,
-        seed        = args.seed,
+        seed        = None if args.load else args.seed,
         log_every   = args.log_every,
         save_every  = args.save_every,
         save_path   = args.save or "",
+        games_per_update = getattr(args, 'games_per_update', 1),
+        transitions_per_step = getattr(args, 'transitions_per_step', 1),
     )
 
 
@@ -156,10 +169,11 @@ def run_play(args):
        -> Greedy (~1ms, never crashes)
     """
     from client.http_client import ContestClient
-    client = ContestClient(base_url=args.url)
+    client = ContestClient(base_url=args.url)  # Reads PROCON_TOKEN from environment.
 
     print("[play] Fetching match config...")
     cfg, map_data, initial_agents = client.get_match_config()
+    client.submit_agent_kinds([a.type for a in initial_agents])
     sim = HexaUdonSimulator(cfg, map_data)
 
     greedy    = GreedyPlanner(cfg, map_data, sim)
@@ -173,6 +187,10 @@ def run_play(args):
             trainer = MAPPOTrainer(device="cpu", log_dir=None)
             trainer.load(args.model)
             rl_model = trainer.model
+            if getattr(args, 'reserve_spots', None) is not None:
+                rl_model.reserve_spots = args.reserve_spots
+                if args.reserve_spots:
+                    rl_model.secondary_routes = True
             rl_model.eval()
             print("[play] RL model loaded.")
         except Exception as e:
@@ -191,7 +209,9 @@ def run_play(args):
             actions, _, _, _ = rl_model.get_action_and_value(
                 state, map_data, cfg, patrol_ids, deterministic=True,
             )
-        return trainer._actions_to_orders(state, map_data, cfg, sim, patrol_ids, actions)
+        return trainer._actions_to_orders(state, map_data, cfg, sim, patrol_ids, actions,
+                                          secondary_routes=rl_model.secondary_routes,
+                                          reserve_spots=rl_model.reserve_spots)
 
     def safe_plan(state, time_limit_ms):
         """Try MCTS -> RL -> Lookahead -> Greedy."""
@@ -223,9 +243,8 @@ def run_play(args):
     fuel_max_locked = False
     for day in range(1, cfg.total_days + 1):
         print(f"\n[play] Day {day}")
-        start = time.monotonic()
-
         state = client.get_day_state(day, cfg, map_data, prev_state)
+        start = time.monotonic()
         time_limit_ms = state.time_limit_ms
         if day == 1 and cfg.fuel_max is None:
             cfg.infer_fuel_max(state.my_agents)
@@ -238,19 +257,22 @@ def run_play(args):
                 print(f"[play] fuel_max inferred = {max(observed)}")
             fuel_max_locked = True
 
+        state.fuel_max = cfg.fuel_max
+        idle_orders = complete_orders([], state, map_data, sim.grid)
+
         # Pre-submit greedy immediately (~1ms) as a safe placeholder
         try:
             greedy_orders = greedy.plan(state)
             if not validate_orders(greedy_orders, state, map_data, sim.grid)[0]:
-                greedy_orders = []
+                greedy_orders = idle_orders
         except Exception as e:
             print(f"[play] Greedy error, submitting empty orders: {e}")
-            greedy_orders = []
+            greedy_orders = idle_orders
 
         resp = client.submit_with_retry(
             day             = day,
             orders          = greedy_orders,
-            fallback_orders = [],
+            fallback_orders = idle_orders,
             deadline_ms     = time_limit_ms,
             start_ms        = start,
         )
@@ -279,7 +301,8 @@ def run_play(args):
         print(f"[play] Submitted — status={resp.get('status')}  elapsed={elapsed:.0f}ms")
         prev_state = state
 
-    print("\n[play] Match complete.")
+    client.session.close()
+    print("\n[play] All daily submissions finished.")
 
 
 # ------------------------------------------------------------------ #
@@ -296,6 +319,12 @@ def main():
     # train
     tr = sub.add_parser("train", help="Train MAPPO")
     tr.add_argument("--episodes",      type=int,   default=1000)
+    tr.add_argument("--target-masking", action=argparse.BooleanOptionalAction, default=None,
+                    help="Sequential stock/reachability masks; saved in checkpoint and restored on resume")
+    tr.add_argument("--games-per-update", type=int, default=1,
+                    help="Collect this many games before PPO update; repeat on resume")
+    tr.add_argument("--transitions-per-step", type=int, default=1,
+                    help="Average gradients over this many days per optimizer step; repeat on resume")
     tr.add_argument("--save",          type=str,   default="model.pt")
     tr.add_argument("--load",          type=str,   default=None)
     tr.add_argument("--device",        type=str,   default="cpu")
@@ -303,6 +332,11 @@ def main():
     tr.add_argument("--log-every",     type=int,   default=50,   dest="log_every")
     tr.add_argument("--log-dir",       type=str,   default="runs/mappo", dest="log_dir")
     tr.add_argument("--curriculum",    action="store_true", help="Enable curriculum learning")
+    tr.add_argument("--finals", action="store_true", help="Use BTC September 18 finals curriculum (16/24/32)")
+    tr.add_argument("--secondary-routes", action=argparse.BooleanOptionalAction, default=None,
+                    help="Append secondary spots after the RL primary target")
+    tr.add_argument("--reserve-spots", action=argparse.BooleanOptionalAction, default=None,
+                    help="Allocate secondary-route stock across patrols; requires --secondary-routes")
     tr.add_argument("--start-level",   type=int,   default=0,    dest="start_level",
                     help="Curriculum start level 0-4")
     tr.add_argument("--selfplay",      action="store_true", help="Enable self-play opponent pool")
@@ -316,6 +350,8 @@ def main():
     pl.add_argument("--url",   type=str, required=True)
     pl.add_argument("--model", type=str, default="model.pt")
     pl.add_argument("--mcts",  action="store_true", help="Use MCTS on top of RL model")
+    pl.add_argument("--reserve-spots", action=argparse.BooleanOptionalAction, default=None,
+                    help="Override checkpoint stock allocation; enabling also enables secondary routes")
 
     args = parser.parse_args()
 

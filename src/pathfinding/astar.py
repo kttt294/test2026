@@ -161,28 +161,12 @@ def multi_waypoint_path(
     fuel_left  = fuel_budget
 
     for wp in waypoints:
-        # A spot at the day's starting cell must be entered again. A zero-hop
-        # shortest path is correct for travel, but does not count as a visit.
+        # One step on the starting spot collects without spending fuel (BTC Q7).
         if wp == cur and not all_actions:
-            loops = []
-            for _, nbr in grid.neighbors(cur):
-                outward = find_path(grid, terrain, traffic, cur, nbr, steps_left, fuel_left)
-                if not outward.reachable:
-                    continue
-                inward = find_path(grid, terrain, traffic, nbr, cur,
-                                   steps_left - outward.total_steps,
-                                   None if fuel_left is None else fuel_left - outward.total_fuel)
-                if inward.reachable:
-                    loops.append(PathResult(outward.actions + inward.actions,
-                                            outward.total_steps + inward.total_steps,
-                                            outward.total_fuel + inward.total_fuel, True))
-            if not loops:
+            if steps_left < 1:
                 break
-            result = min(loops, key=lambda p: (p.total_steps, p.total_fuel))
-            all_actions.extend(result.actions)
-            steps_left -= result.total_steps
-            if fuel_left is not None:
-                fuel_left -= result.total_fuel
+            all_actions.append(AgentAction(cmd="stay"))
+            steps_left -= 1
             continue
         result = find_path(
             grid, terrain, traffic, cur, wp,

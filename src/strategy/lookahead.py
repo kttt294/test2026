@@ -1,13 +1,16 @@
 """
-Look-ahead heuristic planner — primary strategy for contest.
+Look-ahead planner with terminal-score evaluation of daily route candidates.
+
+Compare a greedy day and a multi-spot day using greedy continuation to the
+end of the match. This accounts for fuel spent today reducing future daily
+collections. Rollouts use private traffic history and never mutate the game.
 
 Improvements over GreedyPlanner:
   1. Global series assignment  — no two patrols waste steps on the same uncollected
                                   series when others remain uncovered.
   2. Multi-spot routing        — each patrol visits as many spots as fuel/steps allow
                                   in one day, not just one.
-  3. Fair budget allocation    — shared step budget is divided by priority so the
-                                  most valuable patrol always gets first access.
+  3. Per-car timeline         — every car receives the full day duration.
   4. Supply intercept (push)   — supply car predicts which patrol will be fuel-starved
                                   mid-route and moves to intercept proactively.
   5. Hybrid fuel fallback      — if supply is predicted to arrive too late, patrol
@@ -21,18 +24,23 @@ from __future__ import annotations
 import heapq
 import sys
 import os
+import time
+from copy import deepcopy
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from typing import Dict, List, Optional, Set, Tuple
 
 import config as C
 from env.models import AgentState, DayOrder, DayState, MapData, MatchConfig, Spot
-from env.simulator import HexaUdonSimulator
+from env.simulator import HexaUdonSimulator, complete_orders
+from env.scoring import compute_score
 from pathfinding.astar import find_path, multi_waypoint_path, PathResult
 from strategy.planner import BasePlanner
+from strategy.greedy import GreedyPlanner
 
 
 class LookaheadPlanner(BasePlanner):
+    MAX_SECONDARY = 5
 
     def __init__(self, cfg: MatchConfig, map_data: MapData, sim: HexaUdonSimulator):
         super().__init__(cfg, map_data, sim)
@@ -48,6 +56,36 @@ class LookaheadPlanner(BasePlanner):
     # ------------------------------------------------------------------ #
 
     def plan(self, state: DayState) -> List[DayOrder]:
+        # Keep at least half the caller's allowance for submission/fallback.
+        # The deadline is cooperative: an individual A* call is not preempted.
+        deadline = time.monotonic() + min(0.5, max(0, state.time_limit_ms) / 2000)
+        greedy = GreedyPlanner(self.cfg, self.map, self.sim)
+        best_orders = greedy.plan(state)
+        best_score = None
+        for use_greedy in (True, False):
+            if time.monotonic() >= deadline:
+                break
+            first_orders = best_orders if use_greedy else self._plan_routes(state)
+            orders = first_orders
+            rollout = HexaUdonSimulator(self.cfg, self.map)
+            rollout.traffic = deepcopy(self.sim.traffic)
+            continuation = GreedyPlanner(self.cfg, self.map, rollout)
+            future = state
+            while not rollout.is_done(future):
+                if time.monotonic() >= deadline:
+                    return best_orders
+                future, _ = rollout.apply_day(future, orders)
+                if not rollout.is_done(future):
+                    orders = continuation.plan(future)
+            score = compute_score(future)
+            if best_score is None:
+                best_score = score
+            elif score > best_score:
+                best_orders = first_orders
+                best_score = score
+        return best_orders
+
+    def _plan_routes(self, state: DayState) -> List[DayOrder]:
         patrols  = state.patrol_agents()
         supplies = state.supply_agents()
 
@@ -70,10 +108,8 @@ class LookaheadPlanner(BasePlanner):
             patrols, supplies, assignments, supply_targets, base_budgets, state
         )
 
-        # Step 5 — Sequential planning with dynamic budget
+        # Step 5 — Plan each route within its own daily timeline
         orders: List[DayOrder] = []
-        remaining_shared_steps = state.steps_left
-        leftover_steps = 0
 
         # Sort agents by priority:
         # 1. Patrols targeting uncollected series
@@ -95,9 +131,7 @@ class LookaheadPlanner(BasePlanner):
         orders_by_id: Dict[int, DayOrder] = {}
 
         for agent in sorted_agents:
-            base_b = base_budgets.get(agent.id, 0)
-            # The actual budget for this agent is base + leftover capped by remaining shared steps
-            act_budget = min(base_b + leftover_steps, remaining_shared_steps)
+            act_budget = state.steps_left
 
             if agent.is_patrol():
                 waypoints = assignments.get(agent.id, [])
@@ -129,24 +163,10 @@ class LookaheadPlanner(BasePlanner):
                     )
                     actions = result.actions if result.reachable else []
 
-            # Calculate actual steps used by this agent's actions
-            actual_steps_used = 0
-            cur_cell = agent.cell
-            for act in actions:
-                if act.cmd == "move":
-                    actual_steps_used += self.sim._step_cost(cur_cell, state.traffic)
-                    dst = self.grid.neighbor_in_dir(cur_cell, act.direction)
-                    if dst is not None:
-                        cur_cell = dst
-
-            # Update leftover and remaining shared steps
-            leftover_steps = max(0, act_budget - actual_steps_used)
-            remaining_shared_steps = max(0, remaining_shared_steps - actual_steps_used)
-
             orders_by_id[agent.id] = DayOrder(agent_id=agent.id, actions=actions)
 
         # Re-assemble orders in the order of state.my_agents for consistency
-        return [orders_by_id[a.id] for a in state.my_agents]
+        return complete_orders(list(orders_by_id.values()), state, self.map, self.grid)
 
     # ------------------------------------------------------------------ #
     # Step 1 — Global series assignment                                    #
@@ -246,14 +266,13 @@ class LookaheadPlanner(BasePlanner):
         Greedily pick up to MAX_SECONDARY additional spots reachable after
         the primary target, preferring uncollected series.
         """
-        MAX_SECONDARY = 3
         uncollected = set(self.map.series_ids) - state.collected_series
         claimed_series: Set[int] = set()
 
         secondaries: List[int] = []
         cur = from_cell
 
-        for _ in range(MAX_SECONDARY):
+        for _ in range(self.MAX_SECONDARY):
             best_score = -1.0
             best_cell  = None
 
@@ -308,40 +327,8 @@ class LookaheadPlanner(BasePlanner):
         assignments: Dict[int, List[int]],
         state:       DayState,
     ) -> Dict[int, int]:
-        """
-        Divide the shared step budget across agents.
-
-        Strategy:
-          - Divide steps by patrol priority, without a geometric distance cap.
-          - Patrols going to uncollected series get priority (larger share).
-          - Supply cars share the leftover.
-        """
-        total      = state.steps_left
-        uncollected = set(self.map.series_ids) - state.collected_series
-
-        # Assign weight: 2× for patrols targeting an uncollected series
-        def weight(patrol: AgentState) -> float:
-            wps = assignments.get(patrol.id, [])
-            if not wps:
-                return 1.0
-            first_spot = self.map.spot_map.get(wps[0])
-            if first_spot and first_spot.series_id in uncollected:
-                return 2.0
-            return 1.0
-
-        total_weight = sum(weight(p) for p in patrols) + 0.5 * len(supplies)
-        budgets: Dict[int, int] = {}
-
-        for patrol in patrols:
-            share = int(total * weight(patrol) / total_weight)
-            budgets[patrol.id] = share
-
-        supply_pool = max(0, total - sum(budgets[p.id] for p in patrols))
-        per_supply  = supply_pool // max(len(supplies), 1)
-        for s in supplies:
-            budgets[s.id] = per_supply
-
-        return budgets
+        """Every car has the full day, independent of other cars' routes."""
+        return {a.id: state.steps_left for a in patrols + supplies}
 
     # ------------------------------------------------------------------ #
     # Repositioning & Helper                                               #
@@ -367,6 +354,8 @@ class LookaheadPlanner(BasePlanner):
         fuel_used = 0
         cur_cell = patrol.cell
         for act in actions:
+            if act.cmd == "stay":
+                steps_used += 1
             if act.cmd == "move":
                 steps_used += self.sim._step_cost(cur_cell, state.traffic)
                 fuel_used += self.sim._fuel_cost(cur_cell)

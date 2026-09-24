@@ -39,6 +39,7 @@ LR_CRITIC     = 3e-4
 GAMMA         = 0.99
 GAE_LAMBDA    = 0.95
 CLIP_EPS      = 0.2
+MAX_POLICY_KL = 0.05  # max per-agent KL over the rollout; reject an excessive step
 ENTROPY_COEF  = 0.01
 N_EPOCHS      = 4
 BATCH_SIZE    = 64

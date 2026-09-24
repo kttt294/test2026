@@ -12,10 +12,10 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Tuple
 
-from env.map_generator import MapGenConfig, MatchGenConfig, generate_scenario
+from env.map_generator import generate_contest_scenario, generate_finals_scenario
 from env.models import AgentState, MapData, MatchConfig
 from env.simulator import HexaUdonSimulator
 from env.scoring import Score, compute_score
@@ -46,6 +46,11 @@ LEVELS: List[CurriculumLevel] = [
     CurriculumLevel(5, width=32, height=32, total_days=10, n_agents=8, n_patrol=5, n_series=8, n_spots=20),
 ]
 
+# total_days=0 denotes sampled duration; n_series is the stage's upper bound.
+FINALS_LEVELS = [CurriculumLevel(1, 16, 16, 0, 4, 3, 14, 16),
+                 CurriculumLevel(2, 24, 24, 0, 5, 4, 20, 24),
+                 CurriculumLevel(3, 32, 32, 0, 7, 6, 28, 32)]
+
 ADVANCE_THRESHOLD = 0.50   # RL must beat Lookahead ≥ 50 % of recent episodes
 WIN_WINDOW        = 100    # rolling window size
 MIN_SAMPLES       = 30     # minimum episodes before advancing is possible
@@ -69,8 +74,9 @@ class CurriculumEngine:
             curriculum.try_advance()
     """
 
-    def __init__(self, start_level: int = 0):
-        self._idx    = max(0, min(start_level, len(LEVELS) - 1))
+    def __init__(self, start_level: int = 0, finals: bool = False):
+        self.finals = finals
+        self._idx    = max(0, min(start_level, len(FINALS_LEVELS if finals else LEVELS) - 1))
         self._wins:  deque = deque(maxlen=WIN_WINDOW)
         self._total: int   = 0
 
@@ -80,7 +86,7 @@ class CurriculumEngine:
 
     @property
     def level(self) -> CurriculumLevel:
-        return LEVELS[self._idx]
+        return (FINALS_LEVELS if self.finals else LEVELS)[self._idx]
 
     @property
     def level_number(self) -> int:
@@ -92,7 +98,7 @@ class CurriculumEngine:
 
     @property
     def at_max(self) -> bool:
-        return self._idx >= len(LEVELS) - 1
+        return self._idx >= len(FINALS_LEVELS if self.finals else LEVELS) - 1
 
     # ------------------------------------------------------------------ #
     # Scenario generation                                                  #
@@ -102,17 +108,12 @@ class CurriculumEngine:
         self, seed: int
     ) -> Tuple[MatchConfig, MapData, List[AgentState]]:
         lv = self.level
-        return generate_scenario(
-            seed      = seed,
-            map_cfg   = MapGenConfig(
-                width    = lv.width,
-                height   = lv.height,
-                n_series = lv.n_series,
-                n_spots  = lv.n_spots,
-            ),
-            match_cfg = MatchGenConfig(total_days=lv.total_days),
-            n_agents  = lv.n_agents,
-            n_patrol  = lv.n_patrol,
+        if self.finals:
+            return generate_finals_scenario(seed, lv.width)
+        return generate_contest_scenario(
+            seed, lv.width, lv.height, total_days=lv.total_days,
+            n_agents=lv.n_agents, n_patrol=lv.n_patrol,
+            n_series=lv.n_series, n_spots=lv.n_spots,
         )
 
     # ------------------------------------------------------------------ #
@@ -130,6 +131,7 @@ class CurriculumEngine:
         Used to compare against RL performance.
         """
         import copy
+        cfg = replace(cfg, n_teams=1)
         sim     = HexaUdonSimulator(cfg, map_data)
         state   = sim.reset(copy.deepcopy(agents))
         planner = LookaheadPlanner(cfg, map_data, sim)
@@ -168,8 +170,11 @@ class CurriculumEngine:
     # ------------------------------------------------------------------ #
 
     def state_dict(self) -> dict:
-        return {"level_idx": self._idx, "total_episodes": self._total}
+        return {"level_idx": self._idx, "total_episodes": self._total, "wins": list(self._wins),
+                "finals": self.finals}
 
     def load_state_dict(self, d: dict) -> None:
+        self.finals = d.get('finals', False)
         self._idx   = d.get("level_idx", 0)
         self._total = d.get("total_episodes", 0)
+        self._wins = deque(d.get('wins', []), maxlen=WIN_WINDOW)

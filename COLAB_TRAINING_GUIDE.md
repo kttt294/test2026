@@ -1,5 +1,18 @@
 # Hướng dẫn train RL trên Google Colab (Free GPU)
 
+**16/09: dữ liệu curriculum và self-play đã đổi theo luật BTC.** Xem [bản sửa và smoke test mới](report/TRAINING_SCENARIOS_BTC.md). ZIP cũ chưa chứa các sửa timeline/grid/generator này; chưa dùng ZIP cũ để train dài. Kết quả smoke chỉ xác nhận pipeline chạy, chưa xác nhận sức mạnh thi đấu.
+
+Cập nhật15/09: đã có tùy chọn `--target-masking` dùng chung cho train và
+inference. Xem [kiểm chứng và lệnh mới](report/MASK_INTEGRATION.md). Các ZIP cũ
+chưa chứa thay đổi này; không dùng chúng để resume checkpoint bật masking.
+
+**Chưa khuyến nghị train dài từ smoke_gpu:** kiểm tra GPU đã tái hiện lỗi luôn
+STAY dù KL thấp. Xem kết quả mới nhất trong
+[bản sửa vị trí actor](report/ACTOR_POSITION.md),
+[đối chứng khởi tạo mới](report/INITIALIZATION.md),
+[thí nghiệm gom game](report/ROLLOUT_BATCHING.md) và
+[chẩn đoán STAY](report/STAY_DIAGNOSIS.md) trước khi dùng các lệnh train dài bên dưới.
+
 > Colab free cho T4 GPU (15 GB VRAM) — đủ để train MAPPO với map đến 32×32.  
 > TPU free tier không tương thích tốt với PyTorch → dùng GPU.
 
@@ -21,9 +34,12 @@
 
 **Trên máy local — push code lên GitHub trước:**
 ```bash
-git add -A
+git status --short
+git diff
+git add src tests .gitignore COLAB_TRAINING_GUIDE.md
+git diff --cached
 git commit -m "ready for cloud training"
-git push origin main
+git push origin Procon2026
 ```
 
 Nếu repo private, cần tạo **Personal Access Token** trên GitHub:  
@@ -59,10 +75,10 @@ Output mong đợi:
 
 ```python
 # Nếu repo public:
-!git clone https://github.com/kttt294/Procon2026.git procon2026
+!git clone --branch Procon2026 https://github.com/kttt294/Procon2026.git procon2026
 
 # Nếu repo private (thay YOUR_TOKEN):
-!git clone https://YOUR_TOKEN@github.com/kttt294/Procon2026.git procon2026
+!git clone --branch Procon2026 https://YOUR_TOKEN@github.com/kttt294/Procon2026.git procon2026
 ```
 
 ### Cách B — Upload file zip từ máy local
@@ -114,6 +130,19 @@ GPU: Tesla T4
 
 ## 5. Chạy training
 
+### Kiểm tra ngắn trước khi train dài
+
+Sau khi cập nhật code mới, chạy 20 episode và resume thêm 20 episode. Dùng
+checkpoint thử riêng để không ghi đè model đang train:
+
+```python
+!python src/main.py train --episodes 20 --curriculum --selfplay --selfplay-every 5 --device cuda --seed 42 --log-every 5 --save-every 10 --save /content/drive/MyDrive/procon2026/smoke.pt
+!python src/main.py train --episodes 20 --curriculum --selfplay --device cuda --log-every 5 --load /content/drive/MyDrive/procon2026/smoke.pt --save /content/drive/MyDrive/procon2026/smoke.pt
+```
+
+Lượt resume phải tiếp tục từ episode 21, không quay lại 1; loss phải hữu hạn.
+Checkpoint thử 40 episode chỉ kiểm tra luồng chạy, chưa dùng đánh giá sức chơi.
+
 ### Chạy cơ bản (curriculum + selfplay, tự động lưu vào Drive)
 
 ```python
@@ -131,7 +160,8 @@ GPU: Tesla T4
   --save /content/drive/MyDrive/procon2026/model.pt
 ```
 
-`--save-every 500` tự động ghi checkpoint vào Drive **mỗi 500 episode** — không cần làm gì thêm, không mất data khi Colab timeout.
+`--save-every 500` ghi checkpoint mỗi 500 episode và khi train kết thúc bình thường.
+Nếu runtime bị dừng đột ngột, phần sau checkpoint gần nhất vẫn có thể mất.
 
 ### Các tham số quan trọng
 
@@ -147,6 +177,20 @@ GPU: Tesla T4
 | `--seed` | 42 | Seed để reproduce |
 
 ### Resume từ checkpoint đã lưu
+
+Checkpoint mới lưu cả optimizer, số episode, seed, RNG, lịch sử curriculum và
+trọng số pool self-play. `--episodes` khi resume là **số episode chạy thêm**.
+
+**Chuyển checkpoint PPO cũ sang bản sửa critic:** lần đầu nạp checkpoint chưa có
+nhãn `critic_head_only_v1`, chương trình giữ trọng số, episode, RNG và pool nhưng
+làm mới momentum Adam, kèm cảnh báo `reset optimizer moments once`. Đây là bước
+chuyển đổi có chủ đích do gradient critic cũ gây mất ổn định policy. Checkpoint
+lưu bằng bản mới sẽ giữ đầy đủ optimizer khi resume tiếp. Luôn lưu thử sang tên
+mới (ví dụ `ppo_fixed.pt`), giữ nguyên `smoke_gpu.pt` làm đối chứng.
+
+Seed và lịch cập nhật pool được khôi phục từ checkpoint; không đặt lại bằng seed
+mặc định của lệnh. Giữ `--curriculum --selfplay` nếu phiên trước đã bật hai chế độ này.
+Đường dẫn `--load` không tồn tại sẽ báo lỗi thay vì tự train từ đầu.
 
 ```python
 !python src/main.py train \
@@ -184,7 +228,11 @@ Mở trong một cell riêng **trong khi training đang chạy**:
 
 ## 7. Lưu và resume checkpoint
 
-`--save-every 500 --save /content/drive/MyDrive/procon2026/model.pt` đã đủ — training tự ghi vào Drive mỗi 500 episode, không cần làm gì thêm.
+`--save-every 500 --save /content/drive/MyDrive/procon2026/model.pt` lưu định kỳ và
+lưu cuối phiên. File được ghi tạm trong cùng thư mục rồi thay thế checkpoint cũ
+sau khi ghi thành công; vẫn cần kiểm tra file trên Drive sau phiên cloud.
+Checkpoint cũ chỉ có trọng số vẫn nạp được, nhưng sẽ cảnh báo không thể khôi phục
+optimizer/RNG đã không được lưu. Không thể tái dựng tiến độ bị thiếu từ trọng số.
 
 ### Sau mỗi session — kiểm tra checkpoint còn không
 
@@ -239,7 +287,7 @@ Copy toàn bộ vào một notebook Colab theo thứ tự:
 !nvidia-smi
 
 # Cell 2: Clone repo
-!git clone https://github.com/kttt294/Procon2026.git procon2026
+!git clone --branch Procon2026 https://github.com/kttt294/Procon2026.git procon2026
 
 # Cell 3: Mount Drive
 from google.colab import drive
@@ -309,3 +357,8 @@ python src/main.py play \
   --model model.pt \
   --mcts
 ```
+# Cập nhật 2026-09-15: tạm dừng train dài
+
+Grid/client cũng đã sửa, 173 test pass và kết nối server mẫu BTC qua hai ngày thành công. [Đánh giá mới](report/GRID_CLIENT_FIX.md) vẫn cho thấy checkpoint cũ kém Greedy về Avg Series. Chưa dùng ZIP cũ để train tiếp.
+
+Đã sửa timeline từng xe, tiếp nhiên liệu, thu udon khi chờ và giao thông khi đứng yên; 167 test pass. Xem [báo cáo kiểm toán](report/OFFICIAL_RULE_AUDIT.md). Vẫn cần đối chiếu client/server và đánh giá lại model. Hướng dẫn train bên dưới và ZIP đã tạo là bản trước kiểm toán; chưa dùng để bắt đầu train dài. Giữ checkpoint cũ để đối chứng.
