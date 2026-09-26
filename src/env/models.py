@@ -108,6 +108,7 @@ class DayState:
     # Internal: step counts our agents spent on each road cell today
     # Used to feed into traffic model.
     _road_step_counts: Dict[int, float] = field(default_factory=dict, repr=False)
+    fuel_max: Optional[int] = None  # Capacity, never inferred from a later day's remaining fuel.
 
     def agents_by_id(self) -> Dict[int, AgentState]:
         return {a.id: a for a in self.my_agents}

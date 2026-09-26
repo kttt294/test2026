@@ -50,11 +50,11 @@ class TestNeighbors:
         # cell 12 = (row=2, col=2) is fully interior
         assert len(g.neighbors(12)) == 6
 
-    def test_top_left_corner_has_2_neighbors(self):
+    def test_top_left_corner_has_3_neighbors(self):
         g = grid(4, 4)
-        # cell 0 (row=0, col=0, even row): only E and SE are valid
+        # cell 0 (row=0, col=0, even row): E, SE and SW are valid
         nbrs = g.neighbors(0)
-        assert len(nbrs) == 2
+        assert len(nbrs) == 3
         directions = {d for d, _ in nbrs}
         assert 2 in directions   # E
         assert 3 in directions   # SE
@@ -83,24 +83,24 @@ class TestNeighbors:
         # cell 0 (top-left, even row): NW=0 and NE=1 go off the map
         assert g.neighbor_in_dir(0, 0) is None   # NW
         assert g.neighbor_in_dir(0, 1) is None   # NE
-        assert g.neighbor_in_dir(0, 4) is None   # SW
+        assert g.neighbor_in_dir(0, 4) == 4   # SW is inside the map
         assert g.neighbor_in_dir(0, 5) is None   # W
 
     def test_neighbor_in_dir_known_values(self):
         g = grid(4, 4)
-        # cell 0 (row=0, col=0, even): E=2 → (0,1)=cell 1; SE=3 → (1,0)=cell 4
+        # cell 0 (row=0, col=0, even): E=2 → (0,1)=cell 1; SE=3 → (1,1)=cell 5
         assert g.neighbor_in_dir(0, 2) == 1
-        assert g.neighbor_in_dir(0, 3) == 4
-        # cell 4 (row=1, col=0, odd): E=2 → (1,1)=cell 5; NE=1 → (0,1)=cell 1
+        assert g.neighbor_in_dir(0, 3) == 5
+        # cell 4 (row=1, col=0, odd): E=2 → (1,1)=cell 5; NE=1 → (0,0)=cell 0
         assert g.neighbor_in_dir(4, 2) == 5
-        assert g.neighbor_in_dir(4, 1) == 1
+        assert g.neighbor_in_dir(4, 1) == 0
 
     def test_direction_to_adjacent(self):
         g = grid(4, 4)
         # cell 0 → cell 1 is E (direction 2)
         assert g.direction_to(0, 1) == 2
-        # cell 0 → cell 4 is SE (direction 3)
-        assert g.direction_to(0, 4) == 3
+        # cell 0 → cell 4 is SW (direction 4)
+        assert g.direction_to(0, 4) == 4
 
     def test_direction_to_non_adjacent_is_none(self):
         g = grid(4, 4)
@@ -149,6 +149,6 @@ class TestHexDistance:
         assert g.hex_distance(0, 3) == 3
 
     def test_known_distance_cross_rows(self):
-        # cell 0 (0,0) to cell 5 (1,1): verified manually → 2
+        # cell 0 (0,0) to cell 5 (1,1): adjacent SE → 1
         g = grid(4, 4)
-        assert g.hex_distance(0, 5) == 2
+        assert g.hex_distance(0, 5) == 1

@@ -1,10 +1,20 @@
 # Kế Hoạch Chuyển Dự Án Sang Bài Tập Lớn "Thuật Toán Ứng Dụng"
 
+## Định hướng triển khai đã chốt
+
+- Giai đoạn hiện tại chỉ triển khai rule-based; không train hoặc dùng model ML/RL.
+- Thí nghiệm tìm đường: DFS, BFS, Dijkstra, Greedy Best-First, A* với cùng ngân sách tài nguyên.
+- Thí nghiệm toàn trận: Greedy chọn spot và Lookahead, dùng chung A* và simulator.
+- Giữ riêng hai lớp đánh giá; BFS/DFS không tự giải quyết phân công mục tiêu toàn trận.
+- Giai đoạn cuối so sánh rule-based với RL trên cùng luật, seed đánh giá độc lập,
+  đội hình và giới hạn tài nguyên; kết luận từ dữ liệu, không đặt trước bên thắng.
+- Xem `README.md` để chạy các thí nghiệm và xem điều kiện so sánh công bằng.
+
 ## 1. Mục tiêu
 
 Mục tiêu của file này là định hướng lại dự án HEXA UDON thành một bài tập lớn phù hợp với học phần **Thuật toán ứng dụng**.
 
-Repo hiện tại đã có nhiều thành phần nâng cao, bao gồm simulator, A*, heuristic, benchmark, visualizer và cả Reinforcement Learning. Tuy nhiên, để đạt điểm cao trong học phần thuật toán, phần báo cáo và demo cần đặt trọng tâm vào:
+Repo hiện tại đã có nhiều thành phần nâng cao, bao gồm simulator, A*, heuristic, benchmark, visualizer. Tuy nhiên, để đạt điểm cao trong học phần thuật toán, phần báo cáo và demo cần đặt trọng tâm vào:
 
 - Mô hình hóa bài toán thành đồ thị có trọng số.
 - Thiết kế thuật toán tìm đường.
@@ -12,7 +22,6 @@ Repo hiện tại đã có nhiều thành phần nâng cao, bao gồm simulator,
 - So sánh nhiều thuật toán bằng thực nghiệm.
 - Phân tích độ phức tạp ước lượng.
 
-Reinforcement Learning nên được giữ như **hướng mở rộng nâng cao**, không nên là trọng tâm chính của bài tập lớn.
 
 ## 2. Tên đề tài đề xuất
 
@@ -51,14 +60,6 @@ Trọng tâm nên gồm các nhóm thuật toán:
 7. Kiểm tra tính hợp lệ của lời giải.
 8. Benchmark và phân tích thời gian chạy.
 
-### 3.3. RL chỉ là phần mở rộng
-
-Repo hiện tại đã có RL, nhưng trong bài tập lớn nên ghi:
-
-> Ngoài các thuật toán heuristic, nhóm có thử nghiệm Reinforcement Learning như một hướng mở rộng để học chiến lược từ simulator. Phần này không thay thế phần thuật toán chính mà được dùng để so sánh và đánh giá thêm.
-
-Nếu thời gian báo cáo có hạn, chỉ cần đưa RL vào mục "Hướng phát triển" hoặc "Thử nghiệm nâng cao".
-
 ## 4. Hiện trạng repo
 
 ### 4.1. Đã có
@@ -78,7 +79,6 @@ Nếu thời gian báo cáo có hạn, chỉ cần đưa RL vào mục "Hướng
 | Benchmark | `src/benchmark.py` | Đã có |
 | Replay | `replay/` | Đã có |
 | Visualizer terminal | `visualizer/` | Đã có |
-| RL MAPPO | `src/rl/` | Đã có |
 | Unit tests | `tests/` | Đã có |
 
 ### 4.2. Cần sửa theo hướng bài tập lớn
@@ -90,7 +90,6 @@ Nếu thời gian báo cáo có hạn, chỉ cần đưa RL vào mục "Hướng
 | Thêm bảng so sánh kết quả | Chứng minh Lookahead tốt hơn Greedy |
 | Thêm phần phân tích độ phức tạp | Bắt buộc để đúng tính chất học phần |
 | Thêm script chạy demo đơn giản | Để chấm bài nhanh |
-| Giảm vai trò RL trong tài liệu chính | Tránh bị đánh giá là lệch sang học máy |
 
 ## 5. Cấu trúc tài liệu nên thêm
 
@@ -106,8 +105,7 @@ procon2026/
 └─ docs/
    ├─ problem_model.md
    ├─ algorithms.md
-   ├─ benchmark_protocol.md
-   └─ rl_extension.md
+   └─ benchmark_protocol.md
 ```
 
 Trong đó:
@@ -119,7 +117,6 @@ Trong đó:
 - `docs/problem_model.md`: mô hình hóa bài toán.
 - `docs/algorithms.md`: mô tả Greedy, A*, Lookahead.
 - `docs/benchmark_protocol.md`: cách sinh map và đo kết quả.
-- `docs/rl_extension.md`: mô tả RL như phần mở rộng.
 
 ## 6. Kế hoạch sửa dự án
 
@@ -132,7 +129,6 @@ README cần trả lời nhanh:
 - Cách chạy test.
 - Cách chạy benchmark.
 - Cách chạy demo visualizer.
-- RL nằm ở đâu và có vai trò gì.
 
 Trong README, thứ tự nên là:
 
@@ -141,7 +137,6 @@ Trong README, thứ tự nên là:
 3. Cấu trúc repo.
 4. Hướng dẫn chạy.
 5. Kết quả tóm tắt.
-6. Hướng mở rộng RL.
 
 ### Bước 2: Viết báo cáo chính
 
@@ -175,7 +170,7 @@ Cần trình bày:
 - Traffic làm thay đổi trọng số cạnh của các ô đường.
 - Mỗi ngày là một vòng lặp lập kế hoạch.
 - Mỗi xe là một tác tử.
-- Tổng step mỗi ngày là tài nguyên dùng chung.
+- Mỗi xe có toàn bộ số step của ngày và chạy đồng thời trên cùng timeline.
 - Nhiên liệu là tài nguyên riêng của xe tuần tra.
 - Tồn kho spot là tài nguyên giới hạn.
 
@@ -193,7 +188,7 @@ Cần mô tả rõ các thuật toán:
 
 #### 4.2. A*
 
-- Trạng thái: cell hiện tại.
+- Trạng thái tìm kiếm: cell, số step và nhiên liệu đã dùng; giữ các nhãn chi phí không trội nhau.
 - Cost: tổng step đã dùng.
 - Constraint: fuel và step budget.
 - Heuristic: khoảng cách hex đến đích.
@@ -210,7 +205,7 @@ Cần mô tả rõ các thuật toán:
 - Gán series theo mức độ ưu tiên.
 - Tránh nhiều xe cùng lấy một series mới.
 - Mỗi xe có thể đi qua nhiều spot trong một ngày.
-- Chia step budget theo độ quan trọng của route.
+- Lập route với ngân sách riêng cho mỗi xe và thêm chờ để phủ đủ ngày.
 - Xe tiếp tế dự đoán điểm gặp.
 - Nếu tiếp tế không kịp, xe tuần tra chèn điểm gặp gần xe tiếp tế hơn.
 
@@ -220,17 +215,13 @@ Cần mô tả rõ các thuật toán:
 - Đánh giá vị trí bắt đầu của xe.
 - Chọn phương án có kết quả mô phỏng tốt nhất.
 
-#### 4.6. RL extension
-
-- Trình bày ngắn gọn.
-- Không đặt làm thuật toán chính.
-- Ghi rõ đây là hướng thử nghiệm nâng cao.
-
 ### Bước 5: Thêm phần phân tích độ phức tạp
 
 File: `BTL_complexityAnalysis.md`
 
-Không cần chứng minh quá nặng, nhưng nên có bảng:
+Bảng dưới là ước lượng ban đầu, cần cập nhật theo source đã chuyển từ `Procon2026`: A* giữ nhiều nhãn chi phí khi ràng buộc nhiên liệu, Lookahead mô phỏng đến cuối trận, simulator chạy từng step. Không dùng các công thức cũ làm kết luận cuối cùng.
+
+Bảng tham khảo ban đầu:
 
 | Thành phần | Độ phức tạp ước lượng | Ghi chú |
 |---|---:|---|
@@ -278,12 +269,12 @@ Nên benchmark riêng theo kích thước:
 - 16x16.
 - 32x32.
 
-Nếu `benchmark.py` chưa hỗ trợ chia theo kích thước thì cần sửa thêm option:
+`benchmark.py` hỗ trợ benchmark theo kích thước map:
 
 ```bash
-python src/benchmark.py --games 100 --size 8
-python src/benchmark.py --games 100 --size 16
-python src/benchmark.py --games 100 --size 32
+python src/benchmark.py --games 100 --sizes 8
+python src/benchmark.py --games 100 --sizes 16
+python src/benchmark.py --games 100 --sizes 32
 ```
 
 ### Bước 7: Demo chấm bài
@@ -308,28 +299,6 @@ python src/main.py sim
 python src/benchmark.py --games 100
 ```
 
-### Bước 8: Giữ RL nhưng tách thành phần mở rộng
-
-Repo hiện tại đã có:
-
-- `src/rl/actor_critic.py`
-- `src/rl/mappo.py`
-- `src/rl/curriculum.py`
-- `src/rl/selfplay.py`
-
-Trong tài liệu nên ghi:
-
-> Phần RL được xây dựng như một hướng mở rộng. Do trọng tâm học phần là Thuật toán ứng dụng, kết quả chính của báo cáo tập trung vào Greedy, A*, Lookahead, Agent Selector và Benchmark.
-
-Nếu train RL có kết quả tốt, đưa vào phần nâng cao.
-
-Nếu train RL chưa tốt, vẫn có thể ghi nhận:
-
-- RL cần simulator chuẩn.
-- Training tốn nhiều tài nguyên.
-- Chưa phải phương án phù hợp nhất trong thời gian ngắn.
-- Heuristic có lợi thế về tính ổn định và khả năng giải thích.
-
 ## 7. Việc cần làm ngay
 
 Thứ tự ưu tiên:
@@ -341,7 +310,6 @@ Thứ tự ưu tiên:
 5. Viết `BTL_complexityAnalysis.md`.
 6. Chạy benchmark 100-500 games và viết `BTL_experimentResults.md`.
 7. Sửa `benchmark.py` nếu cần để benchmark theo kích thước map.
-8. Nếu còn thời gian, train RL và đưa vào phần mở rộng.
 
 ## 8. Tiêu chí để nhắm A+
 
@@ -354,7 +322,6 @@ Thứ tự ưu tiên:
 - Có validator và test để chứng minh lời giải đúng.
 - Có benchmark để chứng minh cải tiến của Lookahead so với Greedy.
 - Có visualizer/replay để giải thích hành vi thuật toán.
-- Có hướng mở rộng RL nhưng không làm mờ trọng tâm của môn học.
 
 ## 9. Ranh giới phạm vi
 
@@ -362,12 +329,10 @@ Nên làm:
 
 - Tập trung vào Greedy, A*, Lookahead, Agent Selector.
 - Benchmark và phân tích kết quả nghiêm túc.
-- Mô tả RL là phần mở rộng.
 
 Không nên làm:
 
 - Biến báo cáo thành báo cáo học máy.
-- Nói quá nhiều về PPO/MAPPO nếu chưa có kết quả train tốt.
 - Bỏ qua phần độ phức tạp.
 - Chỉ demo bot chạy mà không có so sánh thuật toán.
 

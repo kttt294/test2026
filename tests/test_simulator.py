@@ -16,7 +16,12 @@ from env.models import (
     AgentAction, AgentState, Cell, CMD_MOVE, CMD_STAY,
     DayOrder, MapData, MatchConfig, Spot,
 )
-from env.simulator import HexaUdonSimulator
+from env.simulator import HexaUdonSimulator, complete_orders
+
+
+def apply_complete_day(sim, state, orders, **kwargs):
+    orders = complete_orders(orders, state, sim.map, sim.grid)
+    return sim.apply_day(state, orders, **kwargs)
 
 
 # ------------------------------------------------------------------ #
@@ -77,21 +82,20 @@ class TestLakeBlocking:
         sim = HexaUdonSimulator(cfg, mp)
 
         state = sim.reset([patrol(0)])
-        state, _ = sim.apply_day(state, [order(1, mv(2))])
-
-        # Agent must still be at cell 0
+        with pytest.raises(ValueError, match="lake"):
+            apply_complete_day(sim, state, [order(1, mv(2))])
         assert state.my_agents[0].cell == 0
 
     def test_move_around_lake_works(self):
-        # Same setup but agent moves SE (dir 3) → cell 4 → valid
+        # Same setup but agent moves SE (dir 3) → cell 5 → valid
         cfg = make_cfg()
         mp  = make_map(terrain_overrides={1: C.TERRAIN_LAKE})
         sim = HexaUdonSimulator(cfg, mp)
 
         state = sim.reset([patrol(0)])
-        state, _ = sim.apply_day(state, [order(1, mv(3))])
+        state = apply_complete_day(sim, state, [order(1, mv(3))])
 
-        assert state.my_agents[0].cell == 4
+        assert state.my_agents[0].cell == 5
 
 
 # ------------------------------------------------------------------ #
@@ -99,20 +103,13 @@ class TestLakeBlocking:
 # ------------------------------------------------------------------ #
 
 class TestFuelExhaustion:
-    def test_patrol_stops_mid_route_on_empty_fuel(self):
-        # Agent with fuel=2 on plain (fuel cost=1 per step).
-        # 3 move actions → should complete 2 then stop.
-        cfg   = make_cfg()
-        mp    = make_map()
-        sim   = HexaUdonSimulator(cfg, mp)
-
-        agent = patrol(0, fuel=2)
-        state = sim.reset([agent])
-        # Move E three times (cells 0→1→2, third would need fuel)
-        state, _ = sim.apply_day(state, [order(1, mv(2), mv(2), mv(2))])
-
-        assert state.my_agents[0].cell == 2
-        assert state.my_agents[0].fuel == 0
+    def test_patrol_exhaustion_rejects_whole_day(self):
+        sim = HexaUdonSimulator(make_cfg(), make_map())
+        state = sim.reset([patrol(0, fuel=2)])
+        with pytest.raises(ValueError, match="fuel"):
+            apply_complete_day(sim, state, [order(1, mv(2), mv(2), mv(2))])
+        assert state.my_agents[0].cell == 0
+        assert state.my_agents[0].fuel == 2
 
     def test_supply_car_ignores_fuel(self):
         # Supply car has fuel=0 but should move freely (no fuel check).
@@ -121,32 +118,32 @@ class TestFuelExhaustion:
         sim   = HexaUdonSimulator(cfg, mp)
 
         state = sim.reset([supply(0, aid=1)])
-        state, _ = sim.apply_day(state, [order(1, mv(2), mv(2))])
+        state = apply_complete_day(sim, state, [order(1, mv(2), mv(2))])
 
         assert state.my_agents[0].cell == 2
 
 
 # ------------------------------------------------------------------ #
-# Rule 3: steps_left is shared across ALL agents                       #
+# Rule 3: each agent has its own full day timeline                       #
 # ------------------------------------------------------------------ #
 
-class TestSharedStepBudget:
-    def test_second_agent_blocked_when_budget_exhausted_by_first(self):
+class TestIndependentStepBudget:
+    def test_second_agent_moves_independently_of_first(self):
         # steps_per_day=4, plain cost=2.
-        # Agent 1 (cell 0) uses 2+2=4 steps. Agent 2 (cell 4) gets 0 left.
+        # Each car has 4 steps; agent 2 moves then waits.
         cfg   = make_cfg(days=1, steps_per_day=[4])
         mp    = make_map()
         sim   = HexaUdonSimulator(cfg, mp)
 
         state = sim.reset([patrol(0, aid=1), supply(4, aid=2)])
-        state, _ = sim.apply_day(state, [
+        state = apply_complete_day(sim, state, [
             order(1, mv(2), mv(2)),    # uses all 4 steps
-            order(2, mv(2)),           # no steps left → blocked
+            order(2, mv(2)),           # moves, then waits for 2 steps
         ])
 
         by_id = state.agents_by_id()
         assert by_id[1].cell == 2   # moved twice
-        assert by_id[2].cell == 4   # didn't move
+        assert by_id[2].cell == 5   # own timeline, independent of first car
 
     def test_partial_use_leaves_budget_for_next_agent(self):
         # Agent 1 uses 2 steps (1 move). Agent 2 gets 2 steps → can move once.
@@ -155,7 +152,7 @@ class TestSharedStepBudget:
         sim   = HexaUdonSimulator(cfg, mp)
 
         state = sim.reset([patrol(0, aid=1), supply(4, aid=2)])
-        state, _ = sim.apply_day(state, [
+        state = apply_complete_day(sim, state, [
             order(1, mv(2)),    # 2 steps used
             order(2, mv(2)),    # 2 steps remaining → fits
         ])
@@ -186,8 +183,8 @@ class TestTrafficModel:
         mp  = make_map(terrain_overrides={0: C.TERRAIN_ROAD})
         sim = HexaUdonSimulator(cfg, mp)
 
-        state = sim.reset([patrol(0)])
-        state, _ = sim.apply_day(
+        state = sim.reset([patrol(4)])
+        state = apply_complete_day(sim,
             state, [order(1)],           # no own moves
             opponent_step_counts={0: 4.0},
         )
@@ -211,10 +208,10 @@ class TestTrafficModel:
         mp  = make_map(terrain_overrides={0: C.TERRAIN_ROAD})
         sim = HexaUdonSimulator(cfg, mp)
 
-        state = sim.reset([patrol(0)])
-        state, _ = sim.apply_day(state, [order(1)],
+        state = sim.reset([patrol(4)])
+        state = apply_complete_day(sim, state, [order(1)],
                                   opponent_step_counts={0: 3.0})   # day 1
-        state, _ = sim.apply_day(state, [order(1)],
+        state = apply_complete_day(sim, state, [order(1)],
                                   opponent_step_counts={0: 3.0})   # day 2
         # Day 3 traffic: sum of days 1+2 = 6 → BUSY
         assert state.traffic.get(0) == C.TRAFFIC_BUSY
@@ -232,7 +229,7 @@ class TestUdonCollection:
         sim  = HexaUdonSimulator(cfg, mp)
 
         state = sim.reset([patrol(0)])
-        state, _ = sim.apply_day(state, [order(1, mv(2))])
+        state = apply_complete_day(sim, state, [order(1, mv(2))])
 
         assert state.total_udon == 1
         assert 1 in state.collected_series
@@ -245,7 +242,7 @@ class TestUdonCollection:
         sim  = HexaUdonSimulator(cfg, mp)
 
         state = sim.reset([patrol(0, fuel=20)])
-        state, _ = sim.apply_day(state, [order(1, mv(2), mv(5), mv(2))])
+        state = apply_complete_day(sim, state, [order(1, mv(2), mv(5), mv(2))])
 
         assert state.total_udon == 1   # only the first visit counts
 
@@ -256,7 +253,7 @@ class TestUdonCollection:
         sim   = HexaUdonSimulator(cfg, mp)
 
         state = sim.reset([supply(0, aid=1)])
-        state, _ = sim.apply_day(state, [order(1, mv(2))])
+        state = apply_complete_day(sim, state, [order(1, mv(2))])
 
         assert state.total_udon == 0
 
@@ -276,12 +273,12 @@ class TestInventoryRefill:
         state = sim.reset([patrol(0, fuel=20)])
 
         # Day 1: move to cell 1, collect
-        state, _ = sim.apply_day(state, [order(1, mv(2))])
+        state = apply_complete_day(sim, state, [order(1, mv(2))])
         assert state.total_udon == 1
 
         # Day 2: move away and come back to cell 1, collect again
         # Agent is at cell 1. Move W → cell 0, then E → cell 1
-        state, _ = sim.apply_day(state, [order(1, mv(5), mv(2))])
+        state = apply_complete_day(sim, state, [order(1, mv(5), mv(2))])
         assert state.total_udon == 2
 
     def test_empty_spot_not_collectable_same_day(self):
@@ -296,7 +293,7 @@ class TestInventoryRefill:
         p2 = patrol(2, fuel=20, aid=2)
         state = sim.reset([p1, p2])
 
-        state, _ = sim.apply_day(state, [
+        state = apply_complete_day(sim, state, [
             order(1, mv(2)),    # patrol 1 moves 0→1, collects (inventory now 0)
             order(2, mv(5)),    # patrol 2 moves 2→1, inventory already 0 → no collect
         ])
@@ -316,8 +313,8 @@ class TestOpponentIsolation:
         mp   = make_map(spots=[spot])
         sim  = HexaUdonSimulator(cfg, mp)
 
-        state = sim.reset([patrol(0)])
-        state, _ = sim.apply_day(
+        state = sim.reset([patrol(4)])
+        state = apply_complete_day(sim,
             state, [order(1)],            # our agent stays
             opponent_step_counts={},      # opponents don't interact with spots
         )

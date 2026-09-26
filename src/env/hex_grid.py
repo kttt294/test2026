@@ -19,10 +19,10 @@ from typing import Dict, List, Optional, Tuple
 
 # (delta_row, delta_col) for each direction, indexed by [row_parity][direction]
 _OFFSETS: List[List[Tuple[int, int]]] = [
-    # even rows
-    [(-1, -1), (-1, 0), (0, 1), (1, 0), (1, -1), (0, -1)],
-    # odd rows
+    # even rows are shifted right (BTC Q1).
     [(-1, 0), (-1, 1), (0, 1), (1, 1), (1, 0), (0, -1)],
+    # odd rows
+    [(-1, -1), (-1, 0), (0, 1), (1, 0), (1, -1), (0, -1)],
 ]
 
 OPPOSITE_DIR = [3, 4, 5, 0, 1, 2]   # opposite of direction d
@@ -98,8 +98,8 @@ class HexGrid:
         r1, c1 = self.cell_to_rc(a)
         r2, c2 = self.cell_to_rc(b)
         # Convert even-r offset → cube
-        q1 = c1 - (r1 - (r1 & 1)) // 2
-        q2 = c2 - (r2 - (r2 & 1)) // 2
+        q1 = c1 - (r1 + (r1 & 1)) // 2
+        q2 = c2 - (r2 + (r2 & 1)) // 2
         dq = q2 - q1
         dr = r2 - r1
         return max(abs(dq), abs(dr), abs(dq + dr))

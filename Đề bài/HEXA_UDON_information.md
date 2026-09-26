@@ -1,5 +1,11 @@
 PROCON - HẠNG MỤC THI ĐẤU "HEXA UDON"
 
+## Lưu ý về timeline — đính chính theo BTC
+
+Lưu ý bổ sung: [Grid hàng chẵn/lẻ và giao thức BTC](LUU_Y_GRID_VA_GIAO_THUC_BTC.md) đã được sửa và kiểm chứng với server mẫu, thay thế các giả định trước đây.
+
+**Mỗi xe có toàn bộ số step của ngày, các xe chạy đồng thời. Không chia chung step cho cả đội.** Xem mục riêng [Timeline, tiếp nhiên liệu, chờ và giao thông](LUU_Y_TIMELINE_BTC.md), có nguồn BTC và ca kiểm chứng. Mục này thay thế giả định shared steps trong các bản code/báo cáo cũ.
+
 **Mục tiêu**: đi qua các spot hiệu quả nhất, thu thập được nhiều udon nhất
 
 **Đơn vị thời gian**: đơn vị thời gian nhỏ nhất dùng để ra lệnh là "step". Trận đấu được chia thành nhiều "ngày". Mỗi ngày có số step riêng và số step mỗi ngày có thể khác nhau. Một trận có thể kéo dài từ 4 đến 10 ngày

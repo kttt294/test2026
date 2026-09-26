@@ -7,6 +7,16 @@ from env.models import (
     DayOrder, DayState, MapData, Spot,
 )
 from env.validator import validate_orders
+from env.simulator import complete_orders
+
+
+def validate_routes(orders, state, mp, grid):
+    """Old route cases explicitly add waits; strict length checks live in test_official_timeline."""
+    try:
+        completed = complete_orders(orders, state, mp, grid)
+    except ValueError as error:
+        return False, [str(error)]
+    return validate_orders(completed, state, mp, grid)
 
 
 # ------------------------------------------------------------------ #
@@ -70,7 +80,7 @@ class TestValidOrders:
         mp    = make_map()
         grid  = make_grid()
         state = make_state([patrol(0)])
-        ok, errors = validate_orders([], state, mp, grid)
+        ok, errors = validate_routes([], state, mp, grid)
         assert ok
         assert errors == []
 
@@ -78,7 +88,7 @@ class TestValidOrders:
         mp    = make_map()
         grid  = make_grid()
         state = make_state([patrol(0)])
-        ok, errors = validate_orders([order(1, stay())], state, mp, grid)
+        ok, errors = validate_routes([order(1, stay())], state, mp, grid)
         assert ok
         assert errors == []
 
@@ -86,7 +96,7 @@ class TestValidOrders:
         mp    = make_map()
         grid  = make_grid()
         state = make_state([patrol(0)])
-        ok, errors = validate_orders([order(1, mv(2))], state, mp, grid)  # E to cell 1
+        ok, errors = validate_routes([order(1, mv(2))], state, mp, grid)  # E to cell 1
         assert ok
         assert errors == []
 
@@ -94,7 +104,7 @@ class TestValidOrders:
         mp    = make_map()
         grid  = make_grid()
         state = make_state([patrol(0, fuel=20)])
-        ok, errors = validate_orders([order(1, mv(2), mv(2))], state, mp, grid)
+        ok, errors = validate_routes([order(1, mv(2), mv(2))], state, mp, grid)
         assert ok
         assert errors == []
 
@@ -108,7 +118,7 @@ class TestLakeValidation:
         mp    = make_map(terrain_overrides={1: C.TERRAIN_LAKE})
         grid  = make_grid()
         state = make_state([patrol(0)])
-        ok, errors = validate_orders([order(1, mv(2))], state, mp, grid)
+        ok, errors = validate_routes([order(1, mv(2))], state, mp, grid)
         assert not ok
         assert any("lake" in e for e in errors)
 
@@ -117,7 +127,7 @@ class TestLakeValidation:
         mp    = make_map(terrain_overrides={1: C.TERRAIN_LAKE})
         grid  = make_grid()
         state = make_state([patrol(0)])
-        ok, errors = validate_orders([order(1, mv(3))], state, mp, grid)
+        ok, errors = validate_routes([order(1, mv(3))], state, mp, grid)
         assert ok
 
 
@@ -131,7 +141,7 @@ class TestEdgeValidation:
         grid  = make_grid()
         state = make_state([patrol(0)])
         # Cell 0 (top-left): dir 0 (NW) goes off map
-        ok, errors = validate_orders([order(1, mv(0))], state, mp, grid)
+        ok, errors = validate_routes([order(1, mv(0))], state, mp, grid)
         assert not ok
         assert any("off map" in e for e in errors)
 
@@ -140,7 +150,7 @@ class TestEdgeValidation:
         grid  = make_grid()
         state = make_state([patrol(0)])
         # Dir 2 (E) from cell 0 → cell 1, valid
-        ok, errors = validate_orders([order(1, mv(2))], state, mp, grid)
+        ok, errors = validate_routes([order(1, mv(2))], state, mp, grid)
         assert ok
 
 
@@ -153,7 +163,7 @@ class TestInvalidDirection:
         mp    = make_map()
         grid  = make_grid()
         state = make_state([patrol(0)])
-        ok, errors = validate_orders([order(1, AgentAction(cmd=CMD_MOVE, direction=6))],
+        ok, errors = validate_routes([order(1, AgentAction(cmd=CMD_MOVE, direction=6))],
                                      state, mp, grid)
         assert not ok
         assert any("invalid direction" in e for e in errors)
@@ -162,7 +172,7 @@ class TestInvalidDirection:
         mp    = make_map()
         grid  = make_grid()
         state = make_state([patrol(0)])
-        ok, errors = validate_orders([order(1, AgentAction(cmd=CMD_MOVE, direction=None))],
+        ok, errors = validate_routes([order(1, AgentAction(cmd=CMD_MOVE, direction=None))],
                                      state, mp, grid)
         assert not ok
         assert any("invalid direction" in e for e in errors)
@@ -178,7 +188,7 @@ class TestStepBudget:
         grid  = make_grid()
         # plain cost=2, budget=2 → exactly 1 move fits
         state = make_state([patrol(0)], steps_left=2)
-        ok, errors = validate_orders([order(1, mv(2))], state, mp, grid)
+        ok, errors = validate_routes([order(1, mv(2))], state, mp, grid)
         assert ok
 
     def test_over_budget_is_invalid(self):
@@ -186,21 +196,20 @@ class TestStepBudget:
         grid  = make_grid()
         state = make_state([patrol(0)], steps_left=2)
         # Two moves would need 4 steps but budget is 2
-        ok, errors = validate_orders([order(1, mv(2), mv(2))], state, mp, grid)
+        ok, errors = validate_routes([order(1, mv(2), mv(2))], state, mp, grid)
         assert not ok
         assert any("step budget" in e for e in errors)
 
-    def test_budget_shared_across_agents(self):
+    def test_budget_independent_across_agents(self):
         mp    = make_map()
         grid  = make_grid()
-        # Agent 1 uses 2 steps (1 move), Agent 2 tries 1 move but 0 steps remain
+        # Both cars can use their own 2 steps
         state = make_state([patrol(0, aid=1), supply(4, aid=2)], steps_left=2)
-        ok, errors = validate_orders([
-            order(1, mv(2)),    # uses all 2 steps
-            order(2, mv(2)),    # 0 left → error
+        ok, errors = validate_routes([
+            order(1, mv(2)),    # uses its 2 steps
+            order(2, mv(2)),    # also has 2 steps
         ], state, mp, grid)
-        assert not ok
-        assert any("step budget" in e for e in errors)
+        assert ok, errors
 
 
 # ------------------------------------------------------------------ #
@@ -213,7 +222,7 @@ class TestFuelBudget:
         grid  = make_grid()
         # Patrol with fuel=1 on plain (fuel_cost=1). Two moves → runs out.
         state = make_state([patrol(0, fuel=1)])
-        ok, errors = validate_orders([order(1, mv(2), mv(2))], state, mp, grid)
+        ok, errors = validate_routes([order(1, mv(2), mv(2))], state, mp, grid)
         assert not ok
         assert any("fuel" in e for e in errors)
 
@@ -221,7 +230,7 @@ class TestFuelBudget:
         mp    = make_map()
         grid  = make_grid()
         state = make_state([patrol(0, fuel=1)])
-        ok, errors = validate_orders([order(1, mv(2))], state, mp, grid)
+        ok, errors = validate_routes([order(1, mv(2))], state, mp, grid)
         assert ok
 
     def test_supply_car_no_fuel_check(self):
@@ -229,7 +238,7 @@ class TestFuelBudget:
         grid  = make_grid()
         # Supply car has fuel=0 but should not be fuel-checked
         state = make_state([supply(0, aid=1)])
-        ok, errors = validate_orders([order(1, mv(2), mv(2))], state, mp, grid)
+        ok, errors = validate_routes([order(1, mv(2), mv(2))], state, mp, grid)
         assert ok
 
     def test_mountain_fuel_cost_detected(self):
@@ -237,7 +246,7 @@ class TestFuelBudget:
         grid  = make_grid()
         # Mountain fuel cost=2. Patrol with fuel=1 cannot move off mountain.
         state = make_state([patrol(0, fuel=1)])
-        ok, errors = validate_orders([order(1, mv(2))], state, mp, grid)
+        ok, errors = validate_routes([order(1, mv(2))], state, mp, grid)
         assert not ok
         assert any("fuel" in e for e in errors)
 
@@ -251,6 +260,6 @@ class TestUnknownAgent:
         mp    = make_map()
         grid  = make_grid()
         state = make_state([patrol(0, aid=1)])
-        ok, errors = validate_orders([order(99, mv(2))], state, mp, grid)
+        ok, errors = validate_routes([order(99, mv(2))], state, mp, grid)
         assert not ok
         assert any("not found" in e for e in errors)

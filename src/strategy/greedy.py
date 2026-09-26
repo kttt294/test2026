@@ -9,7 +9,7 @@ Strategy:
                that is more than 1 hex away.
 
 This is O(n_agents × n_spots) per day and finishes in <1 ms — safe as
-a fallback when RL inference exceeds the time limit.
+a fallback when the main planner fails.
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ import config as C
 from env.models import (
     AgentState, DayOrder, DayState, MapData, MatchConfig, Spot,
 )
-from env.simulator import HexaUdonSimulator
+from env.simulator import HexaUdonSimulator, complete_orders
 from pathfinding.astar import find_path, multi_waypoint_path
 from strategy.planner import BasePlanner
 
@@ -39,7 +39,6 @@ class GreedyPlanner(BasePlanner):
 
     def plan(self, state: DayState) -> List[DayOrder]:
         orders: List[DayOrder] = []
-        steps_remaining = state.steps_left
 
         # Assign each patrol a target spot list (greedy nearest-uncollected)
         patrol_targets: Dict[int, List[int]] = {}
@@ -62,15 +61,10 @@ class GreedyPlanner(BasePlanner):
                 state.traffic,
                 agent.cell,
                 waypoints,
-                step_budget=steps_remaining,
+                step_budget=state.steps_left,
                 fuel_budget=agent.fuel,
             )
             orders.append(DayOrder(agent_id=agent.id, actions=actions))
-            # Rough step deduction (shared budget; exact tracking is in simulator)
-            steps_remaining = max(0, steps_remaining - sum(
-                self.sim._step_cost(agent.cell, state.traffic)
-                for _ in actions
-            ))
 
         # Build actions for supply cars
         for agent in state.supply_agents():
@@ -82,7 +76,7 @@ class GreedyPlanner(BasePlanner):
                     state.traffic,
                     agent.cell,
                     target_cell,
-                    step_budget=steps_remaining,
+                    step_budget=state.steps_left,
                     fuel_budget=None,
                 )
                 actions = result.actions if result.reachable else []
@@ -90,7 +84,7 @@ class GreedyPlanner(BasePlanner):
                 actions = []
             orders.append(DayOrder(agent_id=agent.id, actions=actions))
 
-        return orders
+        return complete_orders(orders, state, self.map, self.grid)
 
     # ------------------------------------------------------------------ #
     # Helpers                                                              #

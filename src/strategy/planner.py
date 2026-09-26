@@ -2,7 +2,7 @@
 Abstract interface for strategic planners.
 
 A planner takes the current DayState and returns DayOrders for all agents.
-Different implementations (greedy, RL, hybrid) conform to this interface.
+Different implementations (greedy, lookahead) conform to this interface.
 """
 from __future__ import annotations
 

@@ -6,7 +6,7 @@ Usage:
     while not sim.is_done(state):
         orders = planner.plan(state)
         rec.record(state, orders)          # capture before applying
-        state, _ = sim.apply_day(state, orders)
+        state = sim.apply_day(state, orders)
     rec.record_final(state)                # capture final state
     rec.save("replays/game_001.json")
 

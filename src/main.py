@@ -2,13 +2,9 @@
 Entry point for HEXA UDON bot.
 
 Modes:
-  train   -- run MAPPO training on the simulator
-  play    -- connect to contest server and play a real match
-  sim     -- run greedy baseline on simulator (quick sanity check)
+  sim     -- compare Greedy and Lookahead on the simulator
 
 Usage:
-  python main.py train --episodes 2000 --save model.pt
-  python main.py play  --url http://192.168.1.100:8080 --model model.pt
   python main.py sim
 """
 from __future__ import annotations
@@ -16,11 +12,10 @@ from __future__ import annotations
 import argparse
 import sys
 import os
-import time
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from env.models import AgentState, DayOrder, MatchConfig, MapData
+from env.models import AgentState, MatchConfig
 from env.simulator import HexaUdonSimulator
 from strategy.greedy import GreedyPlanner
 from strategy.lookahead import LookaheadPlanner
@@ -80,20 +75,17 @@ def _demo_agents() -> list[AgentState]:
 
 def _run_one(label: str, planner, sim, agents_fn):
     state = sim.reset(agents_fn())
-    total_reward = 0.0
     print(f"\n=== {label} ===")
     while not sim.is_done(state):
         orders = planner.plan(state)
-        state, reward = sim.apply_day(state, orders)
-        total_reward += reward
+        state = sim.apply_day(state, orders)
         print(
             f"  Day {state.day-1}: "
             f"series={sorted(state.collected_series)}  "
-            f"udon={state.total_udon}  "
-            f"reward={reward:.1f}"
+            f"udon={state.total_udon}"
         )
     print(f"  Final: unique_series={len(state.collected_series)}  "
-          f"total_udon={state.total_udon}  cumulative_reward={total_reward:.1f}")
+          f"total_udon={state.total_udon}")
     return len(state.collected_series), state.total_udon
 
 
@@ -114,141 +106,6 @@ def run_sim(args):
     print(f"Lookahead: {l_series} series, {l_udon} udon")
 
 
-def run_train(args):
-    """Train MAPPO with optional curriculum and self-play."""
-    from rl.mappo import MAPPOTrainer
-    from rl.curriculum import CurriculumEngine
-    from rl.selfplay import SelfPlayPool
-
-    curriculum = CurriculumEngine(start_level=args.start_level) if args.curriculum else None
-    selfplay   = SelfPlayPool(update_every=args.selfplay_every)  if args.selfplay   else None
-
-    trainer = MAPPOTrainer(
-        device     = args.device,
-        log_dir    = args.log_dir,
-        curriculum = curriculum,
-        selfplay   = selfplay,
-    )
-
-    if args.load and os.path.exists(args.load):
-        trainer.load(args.load)
-
-    trainer.train(
-        n_episodes  = args.episodes,
-        seed        = args.seed,
-        log_every   = args.log_every,
-        save_every  = args.save_every,
-        save_path   = args.save or "",
-    )
-
-
-def run_play(args):
-    """
-    Connect to contest server and play.
-
-    Fallback chain (each tier used if the previous raises or times out):
-      MCTS  (if --mcts and model loaded, ~2500ms)
-       -> RL policy (deterministic, ~50ms)
-       -> Lookahead (~5ms)
-       -> Greedy (~1ms, never crashes)
-    """
-    from client.http_client import ContestClient
-    from rl.mappo import MAPPOTrainer
-
-    client = ContestClient(base_url=args.url)
-
-    print("[play] Fetching match config...")
-    cfg, map_data, initial_agents = client.get_match_config()
-    sim = HexaUdonSimulator(cfg, map_data)
-
-    greedy    = GreedyPlanner(cfg, map_data, sim)
-    lookahead = LookaheadPlanner(cfg, map_data, sim)
-
-    use_rl = args.model and os.path.exists(args.model)
-    rl_model = None
-    if use_rl:
-        trainer = MAPPOTrainer(device="cpu")
-        trainer.load(args.model)
-        rl_model = trainer.model
-        rl_model.eval()
-        print("[play] RL model loaded.")
-
-    mcts_planner = None
-    if use_rl and getattr(args, "mcts", False):
-        from strategy.mcts import MCTSPlanner
-        mcts_planner = MCTSPlanner(cfg, map_data, sim, rl_model, time_budget_ms=2500)
-        print("[play] MCTS enabled.")
-
-    def _rl_plan(state):
-        patrol_ids = [a.id for a in state.patrol_agents()]
-        actions, _, _, _ = rl_model.get_action_and_value(
-            state, map_data, cfg, patrol_ids, deterministic=True,
-        )
-        return trainer._actions_to_orders(state, map_data, cfg, sim, patrol_ids, actions)
-
-    def safe_plan(state, time_limit_ms):
-        """Try MCTS -> RL -> Lookahead -> Greedy."""
-        # Tier 1: MCTS
-        if mcts_planner is not None:
-            try:
-                mcts_planner._time_budget_ms = max(500, time_limit_ms - 800)
-                return mcts_planner.plan(state)
-            except Exception as e:
-                print(f"[play] MCTS error: {e}")
-
-        # Tier 2: RL policy
-        if rl_model is not None:
-            try:
-                return _rl_plan(state)
-            except Exception as e:
-                print(f"[play] RL error: {e}")
-
-        # Tier 3: Lookahead
-        try:
-            return lookahead.plan(state)
-        except Exception as e:
-            print(f"[play] Lookahead error: {e}")
-
-        # Tier 4: Greedy (must not crash)
-        return greedy.plan(state)
-
-    prev_state = None
-    fuel_max_locked = False
-    for day in range(1, cfg.total_days + 1):
-        print(f"\n[play] Day {day}")
-        start = time.time()
-
-        state = client.get_day_state(day, cfg, map_data, prev_state)
-        time_limit_ms = state.time_limit_ms
-
-        # Day 1: read fuel_max from initial agent states and set model normalization.
-        if day == 1 and not fuel_max_locked and rl_model is not None:
-            observed = [a.fuel for a in state.my_agents if a.is_patrol()]
-            if observed:
-                rl_model.set_fuel_max(max(observed))
-                print(f"[play] fuel_max inferred = {max(observed)}")
-            fuel_max_locked = True
-
-        # Pre-submit greedy immediately (~1ms) as a safe placeholder
-        greedy_orders = greedy.plan(state)
-
-        # Main planning (MCTS -> RL -> Lookahead -> Greedy)
-        orders = safe_plan(state, time_limit_ms)
-
-        resp = client.submit_with_retry(
-            day             = day,
-            orders          = orders,
-            fallback_orders = greedy_orders,
-            deadline_ms     = time_limit_ms,
-            start_ms        = start,
-        )
-        elapsed = (time.time() - start) * 1000
-        print(f"[play] Submitted — status={resp.get('status')}  elapsed={elapsed:.0f}ms")
-        prev_state = state
-
-    print("\n[play] Match complete.")
-
-
 # ------------------------------------------------------------------ #
 # CLI                                                                  #
 # ------------------------------------------------------------------ #
@@ -258,40 +115,12 @@ def main():
     sub    = parser.add_subparsers(dest="mode", required=True)
 
     # sim
-    sub.add_parser("sim", help="Greedy sanity check on demo map")
-
-    # train
-    tr = sub.add_parser("train", help="Train MAPPO")
-    tr.add_argument("--episodes",      type=int,   default=1000)
-    tr.add_argument("--save",          type=str,   default="model.pt")
-    tr.add_argument("--load",          type=str,   default=None)
-    tr.add_argument("--device",        type=str,   default="cpu")
-    tr.add_argument("--seed",          type=int,   default=42)
-    tr.add_argument("--log-every",     type=int,   default=50,   dest="log_every")
-    tr.add_argument("--log-dir",       type=str,   default="runs/mappo", dest="log_dir")
-    tr.add_argument("--curriculum",    action="store_true", help="Enable curriculum learning")
-    tr.add_argument("--start-level",   type=int,   default=0,    dest="start_level",
-                    help="Curriculum start level 0-4")
-    tr.add_argument("--selfplay",      action="store_true", help="Enable self-play opponent pool")
-    tr.add_argument("--selfplay-every",type=int,   default=1000, dest="selfplay_every",
-                    help="Add checkpoint to self-play pool every N episodes")
-    tr.add_argument("--save-every",    type=int,   default=500,  dest="save_every",
-                    help="Auto-save checkpoint every N episodes (0 = only at end)")
-
-    # play
-    pl = sub.add_parser("play", help="Connect to contest server")
-    pl.add_argument("--url",   type=str, required=True)
-    pl.add_argument("--model", type=str, default="model.pt")
-    pl.add_argument("--mcts",  action="store_true", help="Use MCTS on top of RL model")
+    sub.add_parser("sim", help="Compare Greedy and Lookahead on demo map")
 
     args = parser.parse_args()
 
     if args.mode == "sim":
         run_sim(args)
-    elif args.mode == "train":
-        run_train(args)
-    elif args.mode == "play":
-        run_play(args)
 
 
 if __name__ == "__main__":

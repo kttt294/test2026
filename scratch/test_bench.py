@@ -18,7 +18,7 @@ for game_idx in range(100):
     while not sim.is_done(state):
         try:
             orders = planner.plan(state)
-            state, _ = sim.apply_day(state, orders)
+            state = sim.apply_day(state, orders)
             day += 1
         except Exception as e:
             print(f"CRASH at game_seed={game_seed}, day={day}")
